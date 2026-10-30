@@ -59,6 +59,10 @@ def main():
             return
     serve = os.path.join(ROOT, "web", "scripts", "serve.py")
     site = os.path.join(ROOT, "web", "build", "link")
+    if not os.path.isfile(os.path.join(site, "gta4.wasm")):
+        # (GitHub's "Source code" download has no build in it)
+        stop("The game isn't built in this folder. Download gta4-web-<version>.zip from the Releases page "
+             "(not \"Source code\"), unzip it and run Play GTA IV from there.")
     key = os.path.join(ROOT, "LibertyRecompLib", "aes_key.bin")
     print(f"Disc:          {disc}\nTitle Update:  {update}\n")
     if lan:
