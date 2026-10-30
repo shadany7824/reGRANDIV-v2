@@ -2,6 +2,8 @@
 
 **Grand Theft Auto IV (Xbox 360) running in a web browser**: the real game, recompiled to WebAssembly, drawn with WebGPU, played from your own copy of the disc.
 
+Forked from here. Go support him. https://github.com/itzzace/gta4-web
+
 ![GTA IV's title over Liberty City, running in the browser](web/images/intro-title.jpg)
 
 > ### Built on Liberty Recompiled, LibertyRecompAndroid and the PS5 port
