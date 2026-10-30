@@ -19,6 +19,16 @@ window.Scene3D = (() => {
   // (depth24plus-stencil8 when the device lacks depth32float-stencil8: init)
   let DEPTH = 'depth32float-stencil8';
   const CONSTANTS_SIZE = 4096 * 2 + 1280;
+  // (a draw's blend constant words read as floats, reused every draw)
+  const blendWords = new Uint32Array(4), blendFloats = new Float32Array(blendWords.buffer);
+  // (one word read as a float, without allocating)
+  const wordScratch = new Uint32Array(1), wordFloat = new Float32Array(wordScratch.buffer);
+  const asFloat = w => { wordScratch[0] = w; return wordFloat[0]; };
+  // An event's first bound colour size (the pass's size), else its depth's.
+  function firstSize(e) {
+    const s = e.sizes;
+    return s[0] || s[1] || s[2] || s[3] || s[4];
+  }
   // Which draws to show; replaceable from the console (window.scene3dFilter).
   // Default: full-screen targets outside deferred lighting (stage tags are
   // mostly unknown, so the target size picks the scene passes).
@@ -147,6 +157,12 @@ ${fields}
       if (Module._rex_web_shader_stages) {
         Module._rex_web_shader_stages(parseInt(hash.slice(8), 16) >>> 0, parseInt(hash.slice(0, 8), 16) >>> 0, mask >>> 0);
       }
+      // ...and how much of each constant bank it reads, so the capture
+      // compares and copies only that much for its draws.
+      if (Module._rex_web_shader_constants) {
+        Module._rex_web_shader_constants(parseInt(hash.slice(8), 16) >>> 0, parseInt(hash.slice(0, 8), 16) >>> 0,
+                                         entry.constantNeed[2], entry.constantNeed[3]);
+      }
     }).catch(e => { entry.state = 'failed'; stats.missingShaders = (stats.missingShaders || 0) + 1; });
     return entry;
   }
@@ -155,20 +171,26 @@ ${fields}
   // literal, all of it when one is computed (skinning's bone palettes),
   // none when it has no such binding. render uploads only that much of each
   // block.
+  // need[2] and need[3]: the 256-byte pieces (16 registers each) of the two
+  // blocks it reads, a bit each, for the capture (all of them when an index
+  // is computed): it compares and copies only those.
   function constantNeed(code) {
-    const need = [0, 0];
+    const need = [0, 0, 0, 0];
     for (const [, binding, name] of code.matchAll(/@group\(0\) @binding\(([01])\)\s*var<uniform> (\w+)/g)) {
-      let max = -1, dynamic = false;
-      for (const m of code.matchAll(new RegExp(name + '\\.member\\[([^\\]]*(?:\\][^\\]]*)?)\\]', 'g'))) {
+      let max = -1, dynamic = false, pieces = 0;
+      // (the index: brackets balanced one level deep, `member[a[1]]`)
+      for (const m of code.matchAll(new RegExp(name + '\\.member\\[((?:[^\\[\\]]|\\[[^\\[\\]]*\\])*)\\]', 'g'))) {
         const index = m[1];
+        let register = -1;
         let r = /^(\d+)u$/.exec(index);
-        if (r) { max = Math.max(max, +r[1]); continue; }
-        r = /^\(u32\((\d+)u\) >> bitcast<u32>\(4u\)\)$/.exec(index);
-        if (r) { max = Math.max(max, +r[1] >> 4); continue; }
-        dynamic = true;
-        break;
+        if (r) register = +r[1];
+        else if ((r = /^\(u32\((\d+)u\) >> bitcast<u32>\(4u\)\)$/.exec(index))) register = +r[1] >> 4;
+        if (register < 0 || register > 255) { dynamic = true; break; }
+        max = Math.max(max, register);
+        pieces |= 1 << (register >> 4);
       }
       need[+binding] = dynamic ? 4096 : Math.max(256, Math.ceil((max + 1) * 16 / 256) * 256);
+      need[2 + +binding] = dynamic ? 0xFFFF : pieces || 1;
     }
     return need;
   }
@@ -338,7 +360,7 @@ fn dec3n(v: u32) -> vec4<f32> {
     }
     // (the constant depth bias, params 11, as an NDC offset: the depth range
     // scales depth units; none for points and lines, as rasterState)
-    const f32 = new Float32Array(new Uint32Array([d.params[11]]).buffer)[0];
+    const f32 = asFloat(d.params[11]);
     const range = Math.abs(d.viewport[5] - d.viewport[4]);
     // (none for a zero-width depth range: every depth is the same there)
     vt.bias = d.topology >= 3 && Number.isFinite(f32) && f32 !== 0 && range > 1e-6 &&
@@ -396,7 +418,36 @@ fn dec3n(v: u32) -> vec4<f32> {
   // The pipeline for a draw, or null while it is being built (or failed).
   // A pipeline's identity from the draw's numbers (no layouts built): the
   // shader pair, declaration, streams and fixed-function state.
+  // (the last draw's key and the values it was made from: consecutive draws
+  // mostly share them, and comparing numbers is far cheaper than making the
+  // string again)
+  const qkValues = new Float64Array(40), qkLast = new Float64Array(40);
+  let qkLastKey = null, qkLastVs = null, qkLastPs = null, qkLastVt = null;
+  // (any of quickKeyString's debugging switches set: read once a frame, render)
+  let qkDebugOn = false;
+  const qkDebug = () => !!(window.s3dNoCull || window.s3dNoStencil || window.s3dFlipCull || window.s3dSolid ||
+                           window.s3dNoDepth || window.s3dUnclipped);
   function quickKey(d) {
+    const st = d.streams, p = d.params, v = qkValues;
+    let n = 0;
+    v[n++] = d.decl;
+    for (let s = 0; s < 4; s++) v[n++] = st[s].data ? st[s].stride : -1;
+    v[n++] = d.topology; v[n++] = d.index32; v[n++] = d.indexed ? 1 : 0; v[n++] = d.viewport[4] === d.viewport[5] ? 1 : 0;
+    v[n++] = d.noDepth ? 1 : 0; v[n++] = d.alphaSpec; v[n++] = d.targetMask; v[n++] = p[19];
+    for (let i = 0; i < 4; i++) v[n++] = d.blends[i];
+    v[n++] = d.writeMask; v[n++] = d.depthEnable; v[n++] = d.depthFunction; v[n++] = d.depthWrite;
+    for (let i = 0; i < 6; i++) v[n++] = p[i];
+    v[n++] = p[11]; v[n++] = p[12]; v[n++] = p[17] & 1;
+    if (qkLastKey !== null && d.vs === qkLastVs && d.ps === qkLastPs && d.vtKey === qkLastVt && !qkDebugOn) {
+      let same = true;
+      for (let i = 0; i < n; i++) if (v[i] !== qkLast[i]) { same = false; break; }
+      if (same) return qkLastKey;
+    }
+    qkLast.set(v);
+    qkLastVs = d.vs; qkLastPs = d.ps; qkLastVt = d.vtKey;
+    return qkLastKey = quickKeyString(d);
+  }
+  function quickKeyString(d) {
     const st = d.streams, p = d.params;
     return d.vs + d.ps + d.decl + ',' + (st[0].data ? st[0].stride : -1) + ',' + (st[1].data ? st[1].stride : -1) + ',' +
       (st[2].data ? st[2].stride : -1) + ',' + (st[3].data ? st[3].stride : -1) + ',' + d.topology + ',' + d.index32 +
@@ -675,8 +726,11 @@ fn dec3n(v: u32) -> vec4<f32> {
     return { data: u32[w] + u32[w + 1] * 4294967296, id: u32[w + 2], serial: u32[w + 3],
              size: u32[w + 4], offset: u32[w + 5], stride: u32[w + 6] };
   }
-  function paramFloat(i) { return (this.paramsF ??= new Float32Array(this.params.buffer))[i]; }
-  // A WebDraw (web_frame_capture.h), by its byte offsets / 4.
+  // (params as floats, read where the capture left them)
+  function paramFloat(i) { return heapFloats[this.paramsAt + i]; }
+  // A WebDraw (web_frame_capture.h), by its byte offsets / 4. Its arrays are
+  // views of the capture's memory, valid while this frame replays (kept
+  // records copy them: recordPipeline).
   function readDraw(m, at) {
     if (!heapWords || heapWords.buffer !== m.buffer) {
       heapWords = new Uint32Array(m.buffer);
@@ -696,17 +750,18 @@ fn dec3n(v: u32) -> vec4<f32> {
       decl: u32[w + 19], stage: u32[w + 20], blend: u32[w + 21],
       writeMask: u32[w + 22], depthEnable: u32[w + 23],
       depthFunction: u32[w + 24], depthWrite: u32[w + 25],
-      viewport: heapFloats.slice(w + 27, w + 33),
+      viewport: heapFloats.subarray(w + 27, w + 33),
       targetWidth: u32[w + 33], targetHeight: u32[w + 34],
-      textures: u32.slice(w + 35, w + 61),
-      samplerWords: u32.slice(w + 134, w + 160),
+      textures: u32.subarray(w + 35, w + 61),
+      samplerWords: u32.subarray(w + 134, w + 160),
       streams: [readBuffer(u32, w + 62), readBuffer(u32, w + 70), readBuffer(u32, w + 78), readBuffer(u32, w + 86)],
       kind: u32[w + 94],
       colors: [u32[w + 95], u32[w + 96], u32[w + 97], u32[w + 98]],
       depth: u32[w + 99],
       sizes: [u32[w + 100], u32[w + 101], u32[w + 102], u32[w + 103], u32[w + 104]],
       blends: [u32[w + 105], u32[w + 106], u32[w + 107], u32[w + 108]],
-      params: u32.slice(w + 109, w + 129),
+      params: u32.subarray(w + 109, w + 129),
+      paramsAt: w + 109,
       paramFloat,
     };
     d.indexed = d.indices.data !== 0;
@@ -1017,6 +1072,7 @@ fn dec3n(v: u32) -> vec4<f32> {
     // texture table entry `index` (0-based), or null.
     render(m, heap, frame, textureView, encoder) {
       const profStart = performance.now();
+      qkDebugOn = qkDebug();
       const eventCount = m.getUint32(frame + 48, true);
       const declTable = Number(m.getBigUint64(frame + 64, true));
       const eventTable = Number(m.getBigUint64(frame + 56, true));
@@ -1120,11 +1176,18 @@ fn dec3n(v: u32) -> vec4<f32> {
       const endPass = () => { if (pass) { pass.end(); pass = null; passKey = ''; } };
       // A pass over the bound surfaces, applying their pending clears.
       const beginPass = e => {
-        // (the pass already open over these surfaces: most draws)
-        const key = e.colors.join() + '|' + e.depth + '|' + e.sizes.join() +
-          (e.kind === 0 || e.kind === 1 ? '|' + (e.params[19] >>> 0) : '');
+        // (the pass already open over these surfaces: most draws - compared
+        // field by field, the key made only for a new pass)
+        const formats = e.kind === 0 || e.kind === 1 ? e.params[19] >>> 0 : -1;
+        if (pass && pass.formats === formats && pass.depthHandle === e.depth) {
+          let same = true;
+          for (let i = 0; i < 4 && same; i++) same = pass.colorHandles[i] === e.colors[i];
+          for (let i = 0; i < 5 && same; i++) same = pass.sizeWords[i] === e.sizes[i];
+          if (same) return pass.mask;
+        }
+        const key = e.colors.join() + '|' + e.depth + '|' + e.sizes.join() + (formats >= 0 ? '|' + formats : '');
         if (pass && key === passKey) return pass.mask;
-        const colors = [], first = e.sizes.slice(0, 4).find(x => x) || e.sizes[4];
+        const colors = [], first = firstSize(e);
         let mask = 0;
         for (let i = 0; i < 4; i++) {
           const s = e.colors[i] && e.sizes[i] === first
@@ -1156,6 +1219,13 @@ fn dec3n(v: u32) -> vec4<f32> {
           depthLoadOp: dclear ? 'clear' : 'load', depthStoreOp: 'store', depthClearValue: dclear ? dclear.depth : 1,
           stencilLoadOp: dclear ? 'clear' : 'load', stencilStoreOp: 'store', stencilClearValue: dclear ? dclear.stencil : 0 } });
         pass.mask = mask; pass.width = first & 0xFFFF; pass.height = first >>> 16;
+        pass.formats = formats; pass.depthHandle = e.depth;
+        pass.colorHandles = [...e.colors]; pass.sizeWords = [...e.sizes];
+        // (the state set in this pass, so a draw sets only what changed: each
+        // call into WebGPU costs about a microsecond on a slow CPU, and most
+        // draws repeat most of the last one's state)
+        pass.s = { pipeline: null, bg: [null, null, null], off0: '', vb: [], vbOff: [], ib: null, ibOff: -1, ibFormat: '',
+                   viewport: '', scissor: '', stencil: -1, blend: '' };
         passKey = key;
         stats.passes++;
         return mask;
@@ -1232,7 +1302,7 @@ fn dec3n(v: u32) -> vec4<f32> {
         const mask = beginPass(d);
         if (mask === null) continue;
         d.targetMask = mask;
-        d.noDepth = !(d.depth && d.sizes[4] === (d.sizes.slice(0, 4).find(x => x) || d.sizes[4]));
+        d.noDepth = !(d.depth && d.sizes[4] === firstSize(d));
         // (the alpha test's specialization: enable, bit 1, and the function at 8)
         d.alphaSpec = p[18] & 1 && !window.s3dNoAlphaTest ? 2 | ((p[18] >>> 1) & 7) << 8 : 0;
         const fit = vertexTransform(d, pass.width, pass.height);
@@ -1248,7 +1318,8 @@ fn dec3n(v: u32) -> vec4<f32> {
           continue;
         }
         const { pipeline, layouts, explicit } = built;
-        pass.setPipeline(pipeline);
+        const ps0 = pass.s;
+        if (ps0.pipeline !== pipeline) { pass.setPipeline(pipeline); ps0.pipeline = pipeline; }
         if (explicit) {
           // Explicit layouts: the constants by dynamic offset (one bind group
           // per layout per frame), textures and samplers cached by contents.
@@ -1260,7 +1331,9 @@ fn dec3n(v: u32) -> vec4<f32> {
                   resource: { buffer: constants, offset: 0, size: b.binding === 2 ? 1280 : 4096 } })) });
                 frameConstantGroups.set(g.id, bg);
               }
-              pass.setBindGroup(0, bg, g.bindings.map(b => d.cOff[b.binding] || 0));
+              const offsets = g.bindings.map(b => d.cOff[b.binding] || 0);
+              const off = offsets.join();
+              if (ps0.bg[0] !== bg || ps0.off0 !== off) { pass.setBindGroup(0, bg, offsets); ps0.bg[0] = bg; ps0.off0 = off; }
             } else if (gi === 1) {
               const views = g.bindings.map(b => bindingView(b, d));
               let key = g.id + ':';
@@ -1271,7 +1344,7 @@ fn dec3n(v: u32) -> vec4<f32> {
                 if (cachedGroups.size > 8000) cachedGroups.clear();
                 cachedGroups.set(key, bg);
               }
-              pass.setBindGroup(1, bg);
+              if (ps0.bg[1] !== bg) { pass.setBindGroup(1, bg); ps0.bg[1] = bg; }
             } else {
               let key = 's' + g.id + ':';
               for (const b of g.bindings) key += d.samplerWords[b.binding & 31] + ',';
@@ -1281,7 +1354,7 @@ fn dec3n(v: u32) -> vec4<f32> {
                   resource: samplerFor(d.samplerWords[b.binding & 31], b.type === 'sampler_comparison') })) });
                 cachedGroups.set(key, bg);
               }
-              pass.setBindGroup(2, bg);
+              if (ps0.bg[2] !== bg) { pass.setBindGroup(2, bg); ps0.bg[2] = bg; }
             }
           });
         }
@@ -1307,17 +1380,25 @@ fn dec3n(v: u32) -> vec4<f32> {
         for (let g = 0; g <= maxGroup; g++) {
           pass.setBindGroup(g, device.createBindGroup({ layout: pipeline.getBindGroupLayout(g), entries: groups[g] }));
         }
+        ps0.bg = [null, null, null];
+        ps0.off0 = '';
         }
         const profC = window.s3dProf ? performance.now() : 0;
-        layouts.forEach((l, slot) => {
+        for (let slot = 0; slot < layouts.length; slot++) {
+          const l = layouts[slot];
+          let buffer, offset = 0;
           if (l.stream < 0) {
-            dummies.zeroVertex ??= device.createBuffer({ size: 64, usage: GPUBufferUsage.VERTEX });
-            pass.setVertexBuffer(slot, dummies.zeroVertex);
+            buffer = dummies.zeroVertex ??= device.createBuffer({ size: 64, usage: GPUBufferUsage.VERTEX });
           } else {
             const st = d.streams[l.stream];
-            pass.setVertexBuffer(slot, gpuBuffer(heap, st, GPUBufferUsage.VERTEX), (st.offset & ~3) + (st.arena || 0));
+            buffer = gpuBuffer(heap, st, GPUBufferUsage.VERTEX);
+            offset = (st.offset & ~3) + (st.arena || 0);
           }
-        });
+          if (ps0.vb[slot] !== buffer || ps0.vbOff[slot] !== offset) {
+            pass.setVertexBuffer(slot, buffer, offset);
+            ps0.vb[slot] = buffer; ps0.vbOff[slot] = offset;
+          }
+        }
         // The viewport: the part inside the surface (vertexTransform keeps the
         // guest's transform for the rest), and its depth range as the guest
         // set it (one from 1 down to 0 set the right way round: the vertex
@@ -1325,25 +1406,49 @@ fn dec3n(v: u32) -> vec4<f32> {
         const PW = pass.width, PH = pass.height;
         const [x, y, w, h] = fit.rect;
         const z0 = Math.min(1, Math.max(0, d.viewport[4] || 0)), z1 = Math.min(1, Math.max(0, d.viewport[5] || 0));
-        pass.setViewport(x, y, w, h, Math.min(z0, z1), Math.max(z0, z1));
+        const viewportKey = x + ',' + y + ',' + w + ',' + h + ',' + z0 + ',' + z1;
+        if (ps0.viewport !== viewportKey) {
+          pass.setViewport(x, y, w, h, Math.min(z0, z1), Math.max(z0, z1));
+          ps0.viewport = viewportKey;
+        }
         // Dynamic state: scissor, stencil reference, blend constant.
         // (the scissor always: the hardware's window scissor, which the XDK
         // narrows to the D3D one when that is on, as the native renderer)
         const sl = Math.max(0, Math.min(PW, p[7] | 0)), st = Math.max(0, Math.min(PH, p[8] | 0));
         const sr = Math.max(sl, Math.min(PW, p[9] | 0)), sb = Math.max(st, Math.min(PH, p[10] | 0));
         if (sr <= sl || sb <= st) continue;  // nothing would be drawn
-        pass.setScissorRect(sl, st, sr - sl, sb - st);
-        pass.setStencilReference(stencilWord(d) & 255);
+        const scissorKey = sl + ',' + st + ',' + sr + ',' + sb;
+        if (ps0.scissor !== scissorKey) { pass.setScissorRect(sl, st, sr - sl, sb - st); ps0.scissor = scissorKey; }
+        const stencil = stencilWord(d) & 255;
+        if (ps0.stencil !== stencil) { pass.setStencilReference(stencil); ps0.stencil = stencil; }
         // (blend factors 14 and 15, constant alpha, read the constant's alpha
         // in WebGPU's 'constant': when a draw blends with those and not the
         // constant colour, its RGB is the alpha)
-        const bc = new Float32Array(new Uint32Array([p[13], p[14], p[15], p[16]]).buffer);
-        const factorsUsed = d.blends.filter(b => b & 0x80000000).flatMap(b => [b & 0x1F, (b >>> 8) & 0x1F, (b >>> 16) & 0x1F, (b >>> 24) & 0x1F]);
-        const constantAlpha = factorsUsed.some(f => f === 14 || f === 15) && !factorsUsed.some(f => f === 12 || f === 13);
-        pass.setBlendConstant(constantAlpha ? { r: bc[3], g: bc[3], b: bc[3], a: bc[3] } : { r: bc[0], g: bc[1], b: bc[2], a: bc[3] });
+        let alphaFactor = false, colorFactor = false;
+        for (let i = 0; i < 4; i++) {
+          const b = d.blends[i];
+          if (!(b & 0x80000000)) continue;
+          for (let k = 0; k < 32; k += 8) {
+            const f = (b >>> k) & 0x1F;
+            if (f === 14 || f === 15) alphaFactor = true;
+            if (f === 12 || f === 13) colorFactor = true;
+          }
+        }
+        const constantAlpha = alphaFactor && !colorFactor;
+        const blendKey = (constantAlpha ? 'a' : 'c') + p[13] + ',' + p[14] + ',' + p[15] + ',' + p[16];
+        if (ps0.blend !== blendKey) {
+          blendWords[0] = p[13]; blendWords[1] = p[14]; blendWords[2] = p[15]; blendWords[3] = p[16];
+          const bc = blendFloats;
+          pass.setBlendConstant(constantAlpha ? { r: bc[3], g: bc[3], b: bc[3], a: bc[3] } : { r: bc[0], g: bc[1], b: bc[2], a: bc[3] });
+          ps0.blend = blendKey;
+        }
         if (d.indexed) {
-          pass.setIndexBuffer(gpuBuffer(heap, d.indices, GPUBufferUsage.INDEX), d.index32 ? 'uint32' : 'uint16',
-                              d.indices.arena || 0);
+          const ib = gpuBuffer(heap, d.indices, GPUBufferUsage.INDEX), ibFormat = d.index32 ? 'uint32' : 'uint16';
+          const ibOff = d.indices.arena || 0;
+          if (ps0.ib !== ib || ps0.ibOff !== ibOff || ps0.ibFormat !== ibFormat) {
+            pass.setIndexBuffer(ib, ibFormat, ibOff);
+            ps0.ib = ib; ps0.ibOff = ibOff; ps0.ibFormat = ibFormat;
+          }
           pass.drawIndexed(d.count, 1, d.first, d.baseVertex);
         } else {
           pass.draw(d.count, 1, d.first);

@@ -61,7 +61,7 @@
 #include "gta4_draw_distance_policy.h"
 
 REXCVAR_DECLARE(uint32_t, gta4_shadow_map_base_size);
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
 REXCVAR_DECLARE(uint32_t, gta4_native_shadow_min_indices);
 REXCVAR_DECLARE(uint32_t, ps5_environment_reflection_every);
 REXCVAR_DECLARE(uint32_t, ps5_water_reflection_every);
@@ -99,8 +99,11 @@ REXCVAR_DEFINE_BOOL(
     "Diagnostic-only removal of the authored filler-light flag from apartment bulb x890")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
 bool DropSmallShadowDraw(uint8_t* base, uint32_t device, uint32_t index_count);  // (below)
+#endif
+#if REX_PLATFORM_WEB
+REXCVAR_DECLARE(uint32_t, web_water_reflection_min_indices);
 #endif
 
 namespace {
@@ -2649,7 +2652,7 @@ double GetExteriorReflectionCaptureDistance() {
 }
 
 rex::system::IGraphicsSystem* GetNativeGraphicsSystem() {
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
   // [ps5 port] Asked several times per draw; the graphics system lives as long
   // as the game does here (the app ends with the process), so look it up once.
   static std::atomic<rex::system::IGraphicsSystem*> cached{nullptr};
@@ -2663,7 +2666,7 @@ rex::system::IGraphicsSystem* GetNativeGraphicsSystem() {
   if (!graphics || graphics->GetTitleCommandAbi(kTitleId) != kTitleCommandAbi) {
     return nullptr;
   }
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
   cached.store(graphics, std::memory_order_release);
 #endif
   return graphics;
@@ -4724,7 +4727,7 @@ extern "C" void sub_828E7000(PPCContext& ctx, uint8_t* base) {
 
 extern "C" void sub_828BFC00(PPCContext& ctx, uint8_t* base) {
   LogKnownOffscreenTransformBoundary("offscreen-boundary-indexed-entry", ctx, base, ctx.r3.u32);
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
   // [ps5 port] The game's geometry draw: vertex declaration (when it changed),
   // indices, stream and DrawIndexedPrimitive, each a command we capture. A
   // small geometry going into the sun shadow map, whose draw DropSmallShadowDraw
@@ -6044,7 +6047,7 @@ extern "C" void sub_82A3DAB0(PPCContext& ctx, uint8_t* base) {
   ctx.r3.u32 = vertex_data;
 }
 
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
 bool SkipReflectionRestCommand(uint8_t* base, uint32_t device);  // (below)
 #endif
 
@@ -6070,7 +6073,7 @@ extern "C" void sub_82A3DF50(PPCContext& ctx, uint8_t* base) {
     return;
   }
 
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
   if (SkipReflectionRestCommand(base, device)) {
     // (the state changes it took at its begin stay pending for the next draw)
     for (size_t index = 0; index < g_pending_draw_primitive_up.dirty_state.words.size(); ++index) {
@@ -6101,7 +6104,7 @@ extern "C" void sub_82A3DF50(PPCContext& ctx, uint8_t* base) {
   g_pending_draw_primitive_up = {};
 }
 
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
 // [ps5 port] The reflection targets as the game creates them (sub_828DC7F0),
 // so the hooks can tell a draw into a reflection (the environment map cars
 // and glass reflect, the water's mirror image) without asking the renderer.
@@ -6242,7 +6245,7 @@ extern "C" void sub_82A3DF60(PPCContext& ctx, uint8_t* base) {
   }
 
   const uint32_t device = ctx.r3.u32;
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
   if (SkipReflectionRestCommand(base, device)) return;
 #endif
   DrawPrimitiveCommand command{};
@@ -6277,7 +6280,7 @@ void SubmitNativeResolve(uint8_t* base, uint32_t device, uint32_t flags,
   } else if (source_index < kRenderTargetCount) {
     source_surface = LoadU32(base, device + (kRenderTargetBase + source_index) * sizeof(uint32_t));
   }
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
   {
     // The renderer's test: the source surface's reflection family, else the
     // destination texture's.
@@ -6619,7 +6622,7 @@ extern "C" void sub_828DC7F0(PPCContext& ctx, uint8_t* base) {
     command.physical_height = physical_height;
     command.sample_count_override = GetReflectionSampleCountOverride();
     const bool texture_required = reflection.role == ReflectionRole::kColor;
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
     NoteHookReflectionTarget(command.surface, command.texture, reflection.family);
 #endif
     if (!command.surface || (texture_required && !command.texture) ||
@@ -7447,7 +7450,7 @@ extern "C" void sub_82A3EDA8(PPCContext& ctx, uint8_t* base) {
   ctx.r3.u32 = 0;
 }
 
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
 // [ps5 port] Small Object Shadows off: a small draw into the sun shadow map is
 // dropped here, before it is handed to the renderer. Handing a draw over costs
 // the game's render thread about what recording it costs the renderer, and
@@ -7455,6 +7458,21 @@ extern "C" void sub_82A3EDA8(PPCContext& ctx, uint8_t* base) {
 // a depth-only draw into a square depth surface of 512 or more. Its dirty
 // state is left for the next draw to take.
 bool DropSmallShadowDraw(uint8_t* base, uint32_t device, uint32_t index_count) {
+#if REX_PLATFORM_WEB
+  // [web port] The same for the water's reflection: a 320x180 picture of
+  // nearly the whole scene (a third of the draws of a frame over the docks),
+  // where a small object covers a few pixels at most.
+  if (const uint32_t water_minimum = REXCVAR_GET(web_water_reflection_min_indices);
+      water_minimum && index_count < water_minimum && device) {
+    const uint32_t color = LoadU32(base, device + 12432);
+    ReflectionFamily family{};
+    if (color && FindHookReflectionSurface(color, family) && family == ReflectionFamily::kWater &&
+        !(g_native_captures_open.load(std::memory_order_relaxed) && g_active_native_capture.active)) {
+      rex::frame_stats::g_title_small_shadows_dropped.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+  }
+#endif
   const uint32_t minimum = REXCVAR_GET(gta4_native_shadow_min_indices);
   if (!minimum || index_count >= minimum || !device) return false;
   if (LoadU32(base, device + 12432)) return false;  // a colour target: not the shadow map
@@ -7476,7 +7494,7 @@ extern "C" void sub_82A3E348(PPCContext& ctx, uint8_t* base) {
     __imp__sub_82A3E348(ctx, base);
     return;
   }
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
   if (DropSmallShadowDraw(base, ctx.r3.u32, ctx.r7.u32) ||
       SkipReflectionRestCommand(base, ctx.r3.u32))
     return;
@@ -7645,7 +7663,7 @@ extern "C" void sub_82A457B0(PPCContext& ctx, uint8_t* base) {
   command.depth_bits = std::bit_cast<uint64_t>(ctx.f1.f64);
   command.stencil = ctx.r8.u32;
 
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5
   const bool skip_clear = SkipReflectionRestCommand(base, device);
 #else
   constexpr bool skip_clear = false;

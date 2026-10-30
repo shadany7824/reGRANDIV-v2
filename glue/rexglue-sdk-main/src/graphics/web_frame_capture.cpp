@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <atomic>
+#include <array>
 #include <bit>
 #include <cstring>
 #include <map>
@@ -71,13 +72,17 @@ struct TextureSlot {
   // into recycled memory, so the same address and size can hold a new image.
   uint32_t address = 0, size = 0, checked_frame = 0;
   uint64_t content = 0;
+  uint64_t whole = 0;       // (small textures) a hash of all its base bytes,
+  uint32_t whole_frame = 0; // last checked in this frame
   uint32_t used_frame = 0;  // last frame a draw used it
   bool compressed = false;  // pixels are BC blocks (CopyBlocks), not RGBA
   uint32_t levels = 1;      // mips in pixels, one after another
 };
 std::unordered_map<uint64_t, uint32_t> g_texture_lookup;  // key ^ swizzle -> slot
 // Small textures are rewritten by the game (the 32x32 fade texture holds the
-// fade's opacity), so they are decoded again in every frame that uses them.
+// fade's opacity), so each frame that uses them hashes all their bytes and
+// decodes them again when those changed (16 KiB at most: cheaper than the
+// decode, and the page then uploads only the ones that did change).
 constexpr uint32_t kRedecodeArea = 64 * 64;
 uint32_t g_frame_number = 0;
 TextureSlot g_texture_slots[kMaxTextures];
@@ -322,6 +327,7 @@ void DecodeBlock(xenos::TextureFormat format, const uint8_t* block, uint32_t bx,
 
 // Switches for A/B tests from the page (rex_web_set_option).
 int g_option_formats = 1;    // 1: decode the formats beyond 8888 / DXT1-5
+int g_option_float_targets = 0;  // 1: decode large float textures too (TextureFor)
 int g_option_validate = 1;   // 1: re-check cached textures' bytes each frame
 int g_option_buffers = 1;    // 1: re-check cached vertex/index bytes each frame
 
@@ -578,7 +584,9 @@ bool CopyBlocks(const TextureInfo& info, std::vector<uint8_t>& blocks) {
   return true;
 }
 
-// A hash of three 1 KiB samples (start, middle, end) of guest bytes.
+// A hash of three 256-byte samples (start, middle, end) of guest bytes and
+// the size: new contents in recycled memory change them (once a frame for
+// every buffer and texture drawn, so kept small).
 // (`virtual_address`: a buffer's, which the game gives as a virtual address,
 // as the native renderer reads it; textures' are physical)
 uint64_t ContentSample(uint32_t address, uint32_t size, bool virtual_address = false) {
@@ -590,13 +598,21 @@ uint64_t ContentSample(uint32_t address, uint32_t size, bool virtual_address = f
   const uint8_t* bytes = virtual_address ? g_memory->TranslateVirtual<const uint8_t*>(address)
                                          : g_memory->TranslatePhysical<const uint8_t*>(address);
   if (!bytes) return 0;
-  const uint32_t chunk = std::min<uint32_t>(size, 1024);
-  uint64_t hash = XXH3_64bits(bytes, chunk);
+  const uint32_t chunk = std::min<uint32_t>(size, 256);
+  uint64_t hash = XXH3_64bits(bytes, chunk) ^ size;
   if (size > 3 * chunk) {
     hash ^= XXH3_64bits(bytes + (size / 2 & ~3u), chunk) * 31;
     hash ^= XXH3_64bits(bytes + size - chunk, chunk) * 131;
   }
   return hash;
+}
+
+// A hash of all of a small texture's guest bytes (physical), 0 when they
+// are outside memory.
+uint64_t WholeContent(uint32_t address, uint32_t size) {
+  address &= 0x1FFFFFFFu;
+  if (!size || address + uint64_t(size) > 0x20000000u) return 0;
+  return XXH3_64bits(g_memory->TranslatePhysical<const uint8_t*>(address), size);
 }
 
 xenos::xe_gpu_texture_fetch_t ReadFetch(uint32_t device, uint32_t stage) {
@@ -619,9 +635,41 @@ uint32_t PhysicalPage(uint32_t base) {
   return base & 0x1FFFF;
 }
 
+// Diagnostics: this frame's texture decodes and buffer conversions (count,
+// time, bytes), logged for a frame that spent long on them (OnPresent).
+struct FrameWork {
+  uint32_t decodes = 0, converts = 0;
+  int64_t decode_ns = 0, convert_ns = 0;
+  uint64_t decode_bytes = 0, convert_bytes = 0;
+};
+FrameWork g_frame_work;
+int64_t NowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+bool FillSlotNow(TextureSlot& entry, const TextureInfo& info, uint32_t swizzle);
 // Decodes (or, when the page takes them, copies the compressed blocks of) a
 // texture into its slot.
 bool FillSlot(TextureSlot& entry, const TextureInfo& info, uint32_t swizzle) {
+  const int64_t start = NowNs();
+  const bool ok = FillSlotNow(entry, info, swizzle);
+  const int64_t took = NowNs() - start;
+  g_frame_work.decodes++;
+  g_frame_work.decode_ns += took;
+  g_frame_work.decode_bytes += entry.pixels.size();
+  if (took > 20'000'000) {
+    static int logged = 0;
+    if (logged++ < 40) {
+      REXLOG_INFO("web slow decode: {}x{} format {} dimension {} mips {} at {:08X} -> {} KB {} in {:.1f} ms",
+                  info.width + 1, info.height + 1, uint32_t(info.format), uint32_t(info.dimension),
+                  info.mip_max_level + 1, info.memory.base_address, entry.pixels.size() >> 10,
+                  entry.compressed ? "blocks" : "texels", took / 1e6);
+    }
+  }
+  return ok;
+}
+bool FillSlotNow(TextureSlot& entry, const TextureInfo& info, uint32_t swizzle) {
   const uint32_t width = info.width + 1, height = info.height + 1;
   if (Compressible(info, swizzle) && CopyBlocks(info, entry.pixels)) {
     entry.compressed = true;
@@ -746,7 +794,14 @@ uint32_t TextureFor(uint32_t device, uint32_t stage = 0, bool targets = true) {
     if (entry.key == key && entry.swizzle == fetch.swizzle) {
       entry.used_frame = g_frame_number;
       const bool small = uint32_t(fetch.size_2d.width + 1) * (fetch.size_2d.height + 1) <= kRedecodeArea;
-      bool redecode = small && entry.decoded_frame != g_frame_number;
+      // (once a frame: a texture is looked up for each draw using it)
+      uint64_t whole = 0;
+      bool redecode = false;
+      if (small && entry.decoded_frame != g_frame_number && entry.whole_frame != g_frame_number) {
+        entry.whole_frame = g_frame_number;
+        whole = WholeContent(entry.address, entry.size);
+        redecode = !whole || whole != entry.whole;
+      }
       if (!redecode && g_option_validate && entry.checked_frame != g_frame_number) {
         entry.checked_frame = g_frame_number;
         redecode = ContentSample(entry.address, entry.size) != entry.content;
@@ -755,6 +810,7 @@ uint32_t TextureFor(uint32_t device, uint32_t stage = 0, bool targets = true) {
         entry.decoded_frame = g_frame_number;
         g_textures[i].format = TextureFormatWord(entry, info);
         entry.content = ContentSample(entry.address, entry.size);
+        entry.whole = small ? (whole ? whole : WholeContent(entry.address, entry.size)) : 0;
         g_textures[i].pixels = reinterpret_cast<uint64_t>(entry.pixels.data());
         g_textures[i].serial = ++g_texture_serial;
       }
@@ -762,6 +818,31 @@ uint32_t TextureFor(uint32_t device, uint32_t stage = 0, bool targets = true) {
     }
   }
   if (!TextureInfo::Prepare(fetch, &info)) return 0;
+  // A large float texture is a render target the game samples (the 2560x2560
+  // sun shadow map, a 4096x4096 16_16 float target), met here only in a
+  // scene's first frame, before its resolve is known: its memory holds
+  // nothing the page drew, and decoding it froze that frame for 100-240 ms
+  // and kept 100-130 MB. The draw takes the stand-in for that frame instead.
+  // (The game's own textures are block-compressed or 8-bit.)
+  switch (xenos::TextureFormat(fetch.format)) {
+    case xenos::TextureFormat::k_16_FLOAT:
+    case xenos::TextureFormat::k_16_16_FLOAT:
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+    case xenos::TextureFormat::k_32_FLOAT:
+    case xenos::TextureFormat::k_32_32_FLOAT:
+    case xenos::TextureFormat::k_32_32_32_32_FLOAT:
+      if (!g_option_float_targets && uint64_t(info.width + 1) * (info.height + 1) >= 2048ull * 2048) {
+        static int logged = 0;
+        if (logged++ < 10) {
+          REXLOG_INFO("web texture: {}x{} float target (format {}) at {:08X} not decoded", info.width + 1,
+                      info.height + 1, uint32_t(fetch.format), info.memory.base_address);
+        }
+        return 0;
+      }
+      break;
+    default:
+      break;
+  }
   uint32_t slot = kMaxTextures;
   if (g_texture_count < kMaxTextures) {
     slot = g_texture_count++;
@@ -792,6 +873,7 @@ uint32_t TextureFor(uint32_t device, uint32_t stage = 0, bool targets = true) {
   entry.address = info.memory.base_address;
   entry.size = std::min<uint32_t>(info.memory.base_size ? info.memory.base_size : 4096, 64u << 20);
   entry.content = ContentSample(entry.address, entry.size);
+  entry.whole = uint32_t(info.width + 1) * (info.height + 1) <= kRedecodeArea ? WholeContent(entry.address, entry.size) : 0;
   g_texture_lookup[lookup] = slot;
   NoteControlsPicture(fetch, entry.address);
   g_textures[slot] = {info.width + 1, info.height + 1,
@@ -946,6 +1028,19 @@ uint32_t StageMask(uint64_t hash) {
   const auto found = g_shader_stage_masks.find(hash);
   return found != g_shader_stage_masks.end() ? found->second : ~0u;
 }
+// The 256-byte pieces (16 registers each, a bit each) of the vertex and
+// pixel constant banks each shader reads, by cache hash, as the page works
+// them out from its WGSL (scene3d.js constantNeed, rex_web_shader_constants);
+// unknown shaders: all of both.
+struct ConstantNeed {
+  uint16_t vertex = 0xFFFF, pixel = 0xFFFF;
+};
+std::unordered_map<uint64_t, ConstantNeed> g_shader_constant_needs;
+
+ConstantNeed NeedOf(uint64_t hash) {
+  const auto found = g_shader_constant_needs.find(hash);
+  return found != g_shader_constant_needs.end() ? found->second : ConstantNeed{};
+}
 uint32_t g_vertex_shader = 0, g_pixel_shader = 0, g_declaration = 0, g_index_buffer = 0;
 struct StreamState {
   uint32_t buffer = 0, offset = 0, stride = 0;
@@ -1034,6 +1129,14 @@ std::unordered_map<uint64_t, ConvertedBuffer> g_buffers;
 std::unordered_map<uint32_t, uint32_t> g_unlocks;
 uint32_t g_buffer_serial = 0, g_buffer_id = 0;
 size_t g_buffer_bytes = 0;
+// Diagnostics: buffer conversions by reason (new, unlocked, moved or
+// resized, contents changed, cache full), count and bytes, logged each 120
+// frames.
+struct ConvertCounts {
+  uint32_t count[5] = {};
+  uint64_t bytes[5] = {};
+};
+ConvertCounts g_converts;
 constexpr size_t kMaxBufferBytes = 768u << 20;
 
 // This frame's draws and the bytes they point into (constants, generated
@@ -1045,13 +1148,24 @@ std::vector<uint8_t> g_published_draw_bytes[2];
 // Draw fields holding offsets into g_draw_bytes rather than pointers.
 constexpr uint64_t kOffsetFlag = 1ull << 63;
 
-// The latest copy of each constant block in this frame's bytes.
+// The latest copy of each constant block in this frame's bytes (its first
+// `raw.size()` bytes: as much as that draw's shaders read).
 struct ConstantBlock {
   std::vector<uint8_t> raw;
   size_t offset = 0;
   bool valid = false;
 };
-ConstantBlock g_last_vertex_constants, g_last_pixel_constants, g_last_shared_constants;
+ConstantBlock g_last_shared_constants;
+// The vertex and pixel banks' latest copies: the guest bytes of the pieces
+// stored (`pieces`, ConstantNeed's bits); the other pieces of the stored
+// block are left as they are (no draw using it reads them).
+constexpr uint32_t kConstantPiece = 256;
+struct ConstantBank {
+  std::array<uint8_t, 4096> raw{};
+  uint32_t pieces = 0;
+  size_t offset = 0;
+};
+ConstantBank g_last_vertex_constants, g_last_pixel_constants;
 
 size_t AppendDrawBytes(const void* data, size_t size) {
   const size_t offset = (g_draw_bytes.size() + 255) & ~size_t(255);
@@ -1091,19 +1205,29 @@ ConvertedBuffer* Capture(uint32_t handle, uint32_t declaration, uint32_t stream,
                              : (uint64_t(handle) | uint64_t(declaration) << 32) ^
                                    (uint64_t(stream) << 59 | uint64_t(offset) << 40 | uint64_t(stride) << 24);
   auto found = g_buffers.find(key);
-  if (found != g_buffers.end() && found->second.address == metadata->guest_address &&
-      found->second.size == metadata->guest_size && found->second.flags == flags &&
-      !metadata->guest_locked && found->second.unlocks == g_unlocks[handle]) {
+  int reason = 0;  // (g_converts: new)
+  if (found != g_buffers.end()) {
     ConvertedBuffer& cached = found->second;
-    if (!g_option_buffers || cached.checked_frame == g_frame_number) return &cached;
-    cached.checked_frame = g_frame_number;
-    if (ContentSample(cached.address, cached.size, true) == cached.content) return &cached;
+    const uint32_t unlocks = g_unlocks[handle];
+    if (cached.address != metadata->guest_address || cached.size != metadata->guest_size || cached.flags != flags) {
+      reason = 2;
+    } else if (metadata->guest_locked || cached.unlocks != unlocks) {
+      reason = 1;
+    } else {
+      if (!g_option_buffers || cached.checked_frame == g_frame_number) return &cached;
+      cached.checked_frame = g_frame_number;
+      if (ContentSample(cached.address, cached.size, true) == cached.content) return &cached;
+      reason = 3;
+    }
   }
   if (g_buffer_bytes > kMaxBufferBytes) {
     g_buffers.clear();
     g_buffer_bytes = 0;
     found = g_buffers.end();
+    reason = 4;
   }
+  g_converts.count[reason]++;
+  g_converts.bytes[reason] += metadata->guest_size;
   ConvertedBuffer& entry = found != g_buffers.end() ? found->second : g_buffers[key];
   if (!entry.id) entry.id = ++g_buffer_id;
   g_buffer_bytes -= std::min(g_buffer_bytes, entry.bytes.size());
@@ -1114,6 +1238,16 @@ ConvertedBuffer* Capture(uint32_t handle, uint32_t declaration, uint32_t stream,
   entry.checked_frame = g_frame_number;
   entry.content = ContentSample(entry.address, entry.size, true);
   entry.serial = ++g_buffer_serial;
+  const int64_t convert_start = NowNs();
+  struct ConvertTime {
+    int64_t start;
+    size_t size;
+    ~ConvertTime() {
+      g_frame_work.converts++;
+      g_frame_work.convert_ns += NowNs() - start;
+      g_frame_work.convert_bytes += size;
+    }
+  } convert_time{convert_start, entry.size};
   entry.bytes.resize(entry.size);
   // (a virtual address, as the native renderer reads it: GTA IV keeps some
   // geometry - the sky dome - in ordinary virtual memory, which the
@@ -1227,8 +1361,10 @@ void RecordDraw(uint32_t device_address, uint32_t primitive, uint32_t first, uin
   // read booleans and fixed-function values from.
   // Constants: three blocks, each stored once while consecutive draws share
   // its bytes (most do: a frame has thousands of draws and few changes).
+  // Only the part the draw's shaders read is compared and stored (the page
+  // reads no more of it: scene3d.js constantNeed, the same rule).
   auto block = [](ConstantBlock& last, const uint8_t* guest, size_t size, bool swap) {
-    if (last.valid && !std::memcmp(last.raw.data(), guest, size)) return last.offset;
+    if (last.valid && last.raw.size() >= size && !std::memcmp(last.raw.data(), guest, size)) return last.offset;
     last.raw.assign(guest, guest + size);
     last.offset = AppendDrawBytes(nullptr, size);
     if (swap) {
@@ -1239,8 +1375,36 @@ void RecordDraw(uint32_t device_address, uint32_t primitive, uint32_t first, uin
     last.valid = true;
     return last.offset;
   };
-  draw.constants = kOffsetFlag | block(g_last_vertex_constants, device + kVertexConstantsOffset, kConstantsSize, true);
-  draw.ps_constants = kOffsetFlag | block(g_last_pixel_constants, device + kPixelConstantsOffset, kConstantsSize, true);
+  // The vertex and pixel banks: only the pieces the draw's shaders read
+  // compared and stored; the last block serves while it holds all of them
+  // unchanged. (Stored as long as up to the last piece read: the page reads
+  // that much, scene3d.js constantNeed.)
+  auto bank = [](ConstantBank& last, const uint8_t* guest, uint32_t pieces) {
+    pieces = pieces & 0xFFFF ? pieces & 0xFFFF : 1;
+    if ((last.pieces & pieces) == pieces) {
+      bool same = true;
+      for (uint32_t p = pieces; p && same; p &= p - 1) {
+        const size_t at = size_t(std::countr_zero(p)) * kConstantPiece;
+        same = !std::memcmp(last.raw.data() + at, guest + at, kConstantPiece);
+      }
+      if (same) return last.offset;
+    }
+    const size_t size = size_t(32 - std::countl_zero(pieces)) * kConstantPiece;
+    last.offset = AppendDrawBytes(nullptr, size);
+    for (uint32_t p = pieces; p; p &= p - 1) {
+      const size_t at = size_t(std::countr_zero(p)) * kConstantPiece;
+      std::memcpy(last.raw.data() + at, guest + at, kConstantPiece);
+      native::core::CopyGuestWordsToHost(g_draw_bytes.data() + last.offset + at, guest + at, kConstantPiece);
+    }
+    last.pieces = pieces;
+    return last.offset;
+  };
+  const ConstantNeed vs_need = NeedOf(draw.vs_hash);
+  const ConstantNeed ps_need = draw.ps_hash ? NeedOf(draw.ps_hash) : ConstantNeed{0, 0};
+  draw.constants = kOffsetFlag | bank(g_last_vertex_constants, device + kVertexConstantsOffset,
+                                      vs_need.vertex | ps_need.vertex);
+  draw.ps_constants = kOffsetFlag | bank(g_last_pixel_constants, device + kPixelConstantsOffset,
+                                         vs_need.pixel | ps_need.pixel);
   // The texture stages the shaders sample (also for the samplers' LOD bias).
   const uint32_t stages = StageMask(draw.vs_hash) | (draw.ps_hash ? StageMask(draw.ps_hash) : 0);
   native::core::SharedConstants shared{};
@@ -1884,6 +2048,22 @@ void OnPresent(const void* present_command, size_t command_size) {
   g_pending.clear();
   g_cleared = false;
   g_frame_number++;
+  if (g_frame_work.decode_ns + g_frame_work.convert_ns > 20'000'000) {
+    const auto& w = g_frame_work;
+    REXLOG_INFO("web slow capture: frame {} decoded {} textures ({} KB) in {:.1f} ms, converted {} buffers ({} KB) "
+                "in {:.1f} ms",
+                g_frame_number, w.decodes, w.decode_bytes >> 10, w.decode_ns / 1e6, w.converts, w.convert_bytes >> 10,
+                w.convert_ns / 1e6);
+  }
+  g_frame_work = {};
+  if (g_frame_number % 120 == 0) {
+    auto& c = g_converts;
+    REXLOG_INFO("web buffers: converted new {} ({} KB), unlocked {} ({} KB), moved {} ({} KB), changed {} ({} KB), "
+                "cache full {} ({} KB) in 120 frames; {} cached, {} MB",
+                c.count[0], c.bytes[0] >> 10, c.count[1], c.bytes[1] >> 10, c.count[2], c.bytes[2] >> 10,
+                c.count[3], c.bytes[3] >> 10, c.count[4], c.bytes[4] >> 10, g_buffers.size(), g_buffer_bytes >> 20);
+    c = {};
+  }
   // The page reads the latest frame while the game goes on: a frame goes
   // into the other list only when the page isn't reading it - it has
   // finished the latest frame (WebFrame::consumed) or taken the latest one's
@@ -1895,7 +2075,8 @@ void OnPresent(const void* present_command, size_t command_size) {
       std::atomic_ref<uint32_t>(g_frame.reading).load(std::memory_order_acquire) != g_frame.sequence) {
     g_draws.clear();
     g_draw_bytes.clear();
-    g_last_vertex_constants.valid = g_last_pixel_constants.valid = g_last_shared_constants.valid = false;
+    g_last_vertex_constants.pieces = g_last_pixel_constants.pieces = 0;
+    g_last_shared_constants.valid = false;
     return;
   }
   const int list = g_published_list ^ 1;
@@ -1927,7 +2108,8 @@ void OnPresent(const void* present_command, size_t command_size) {
   g_draws.clear();
   g_draw_bytes.clear();
   // (the blocks lived in the frame just published)
-  g_last_vertex_constants.valid = g_last_pixel_constants.valid = g_last_shared_constants.valid = false;
+  g_last_vertex_constants.pieces = g_last_pixel_constants.pieces = 0;
+  g_last_shared_constants.valid = false;
   const uint64_t bytes = reinterpret_cast<uint64_t>(g_published_draw_bytes[list].data());
   for (auto& draw : g_published_draws[list]) {
     if (draw.constants & kOffsetFlag) draw.constants = bytes + (draw.constants & ~kOffsetFlag);
@@ -1968,7 +2150,19 @@ extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_shader_stages(uint32_t hash_low, ui
   g_shader_stage_masks[uint64_t(hash_high) << 32 | hash_low] = mask;
 }
 
-// Debug switches: 1 = extra texture formats, 2 = texture byte re-checks.
+// The bytes of the vertex and pixel constant banks a shader reads (its
+// WGSL's group 0 bindings 0 and 1, scene3d.js constantNeed).
+// (as bits, a 256-byte piece each: scene3d.js constantNeed)
+extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_shader_constants(uint32_t hash_low, uint32_t hash_high,
+                                                              uint32_t vertex_pieces, uint32_t pixel_pieces) {
+  using namespace rex::graphics::web;
+  std::lock_guard lock(g_mutex);
+  g_shader_constant_needs[uint64_t(hash_high) << 32 | hash_low] = {uint16_t(vertex_pieces),
+                                                                   uint16_t(pixel_pieces)};
+}
+
+// Debug switches: 1 = extra texture formats, 2 = texture byte re-checks,
+// 3 = buffer re-checks, 4 = BC blocks to the page, 5 = large float targets decoded.
 // Changing either drops the texture cache.
 extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_set_option(int option, int value) {
   using namespace rex::graphics::web;
@@ -1977,6 +2171,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_set_option(int option, int value) {
   if (option == 2) g_option_validate = value;
   if (option == 3) g_option_buffers = value;
   if (option == 4) g_option_bc = value;
+  if (option == 5) g_option_float_targets = value;
   g_texture_lookup.clear();
   for (auto& slot : g_texture_slots) slot.key = 0;
 }

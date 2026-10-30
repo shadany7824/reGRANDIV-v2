@@ -22,10 +22,13 @@
  * @license     BSD 3-Clause License
  */
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
+
+#include <unistd.h>
 
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
@@ -64,12 +67,18 @@ const Block* FindBlock(uintptr_t address, size_t length, uintptr_t* out_start) {
 
 void* AllocateBlock(size_t length) {
   length = (length + kWebAllocationGranularity - 1) & ~(kWebAllocationGranularity - 1);
+  // Memory past the heap's end has never been handed out (Emscripten's
+  // malloc never gives memory back, MORECORE_CANNOT_TRIM), so it is still
+  // zero and not yet committed: clearing only the part below the old end
+  // keeps a 4.5 GiB backing block from costing 4.5 GiB of RAM up front.
+  const uintptr_t fresh = reinterpret_cast<uintptr_t>(sbrk(0));
   void* result = std::aligned_alloc(kWebAllocationGranularity, length);
   if (!result) {
     REXLOG_ERROR("web memory: could not allocate {:#x} bytes", length);
     return nullptr;
   }
-  std::memset(result, 0, length);
+  const uintptr_t start = reinterpret_cast<uintptr_t>(result);
+  if (start < fresh) std::memset(result, 0, std::min<size_t>(length, fresh - start));
   std::lock_guard lock(blocks_mutex);
   blocks[reinterpret_cast<uintptr_t>(result)] = {length, true};
   return result;

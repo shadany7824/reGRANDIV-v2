@@ -5,6 +5,9 @@
 #include <sys/stat.h>
 
 #include <rex/platform.h>
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/emscripten.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -382,6 +385,9 @@ void Hub::Load() {
   lang::Set(lang::FromSetting(Value("ps5_language", "auto")));
   debug_options_ = Value("hub_debug_options", "false") == "true";
   KeepHiddenSettings();
+#if defined(__EMSCRIPTEN__)
+  ApplyWebDeviceDefaults();
+#endif
   LoadSaves();
   LoadTrophies();
   // (the game's files come from Recomp Store: only whether they're there)
@@ -2053,6 +2059,48 @@ bool Advanced(const Hub::Setting& r) {
 bool Hub::Shown(const Setting& r) const {
   return debug_options_ || (!Advanced(r) && std::string_view(r.section) != "DEBUG");
 }
+
+#if defined(__EMSCRIPTEN__)
+// [web port] A slower computer starts with less to draw: the first time the
+// hub runs in a browser, the settings that cut what each frame draws (and
+// that the player hasn't set) get values for this machine's CPU threads and
+// memory, as the browser reports them. Once a browser (web_device_defaults
+// records the tier); the Display page changes them as any other.
+// GTA4_WEB_DEVICE_TIER (low, medium, high) chooses the tier instead.
+void Hub::ApplyWebDeviceDefaults() {
+  if (!Value("web_device_defaults", "").empty()) return;
+  const int threads = EM_ASM_INT({ return navigator.hardwareConcurrency | 0; });
+  const int memory_tenths = EM_ASM_INT({ return Math.round((navigator.deviceMemory || 0) * 10); });
+  std::string tier = "high";
+  if ((threads && threads <= 4) || (memory_tenths && memory_tenths <= 40)) {
+    tier = "low";
+  } else if (threads && threads <= 8) {
+    tier = "medium";
+  }
+  if (const char* forced = std::getenv("GTA4_WEB_DEVICE_TIER"); forced && *forced) tier = forced;
+  struct Default {
+    const char* tier;
+    const char* key;
+    const char* value;
+  };
+  // (Draw Distance Shorter - the city's skyline stays, from its distant
+  // models: the arrival shot drew 2,000 things instead of 7,700 - and fewer
+  // cars and people, the fewest for low: each draws less of every frame,
+  // the web build's cost)
+  static const Default kDefaults[] = {
+      {"low", "gta4_draw_distance_scale", "0.75"},
+      {"low", "ps5_population", "0.5"},
+      {"medium", "gta4_draw_distance_scale", "0.75"},
+      {"medium", "ps5_population", "0.75"},
+  };
+  for (const Default& d : kDefaults) {
+    if (tier != d.tier || !Value(d.key, "").empty()) continue;
+    Save(d.key, d.value);
+  }
+  Save("web_device_defaults", "\"" + tier + "\"");
+  std::printf("web hub: %d threads, %.1f GB: %s settings\n", threads, memory_tenths / 10.0, tier.c_str());
+}
+#endif
 
 // What isn't shown is at its recommended value: the Debug page's and the rarer
 // Display settings (as Reset All sets them), and Light Color Fix, which no

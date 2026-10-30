@@ -298,6 +298,9 @@ class Hub {
   int TabsShown() const { return debug_options_ ? kTabCount : kDebugTab; }  // (Debug is the last)
   bool Shown(const Setting& r) const;
   void KeepHiddenSettings();
+#if defined(__EMSCRIPTEN__)
+  void ApplyWebDeviceDefaults();  // [web port] (hub_ui.cpp)
+#endif
   void SetDebugOptions(bool on);
   static std::string VersionLabel(const std::string& v);
   static bool IsSettingsTab(int tab) { return tab == kDisplayTab || tab == kGameTab || tab == kDebugTab; }

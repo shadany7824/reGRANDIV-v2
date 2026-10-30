@@ -76,6 +76,11 @@ void TelemetryEnd(int64_t begin_ns, uint32_t bytes, bool async) {
                         reads / seconds, (unsigned long long)async_reads, total / 1e6 / seconds,
                         reads ? total / 1024.0 / reads : 0.0, reads ? service / 1e6 / reads : 0.0,
                         (long long)peak);
+#elif REX_PLATFORM_WEB
+    const double seconds = last ? double(now - last) / 1e9 : 2.0;
+    REXKRNL_INFO("web io: {:.0f} reads/s ({} async) {:.1f} MB/s avg {:.0f} KB service {:.2f} ms peak-in-flight {}",
+                 reads / seconds, async_reads, total / 1e6 / seconds, reads ? total / 1024.0 / reads : 0.0,
+                 reads ? service / 1e6 / reads : 0.0, peak);
 #endif
   }
 }

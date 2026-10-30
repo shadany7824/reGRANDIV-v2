@@ -23,6 +23,8 @@
 #include <string>
 #include <thread>
 
+#include <emscripten/emscripten.h>
+
 #include <rex/cvar.h>
 #include <rex/graphics/gta4_native/title_commands.h>
 
@@ -36,6 +38,23 @@
 REXCVAR_DEFINE_BOOL(web_uncapped_frames, false, "Web",
                     "Complete frames as fast as the game presents them (no 60 Hz pacing), "
                     "to measure the game's own frame rate");
+// The PS5 build's draw savings, read by gta4_native_hooks.cpp (the native
+// renderer, which defines them there, is not in the web build). Defaults as
+// on the PS5: in busy streets about a fifth of the draws are small objects'
+// shadows, and the car reflections look the same redrawn every other frame;
+// each draw left out saves the capture and the page about 5 us.
+REXCVAR_DEFINE_UINT32(gta4_native_shadow_min_indices, 300, "GTA IV/Graphics/Shadows",
+                      "Skip indexed draws with fewer indices than this in the shadow map passes "
+                      "(0 = draw everything)");
+REXCVAR_DEFINE_UINT32(ps5_environment_reflection_every, 2, "PS5",
+                      "Redraw the environment reflection map (cars, glass) every Nth frame")
+    .range(1, 4);
+REXCVAR_DEFINE_UINT32(ps5_water_reflection_every, 1, "PS5", "Redraw the water reflection every Nth frame")
+    .range(1, 4);
+// (web only: small objects in the water's 320x180 reflection, gta4_native_hooks.cpp)
+REXCVAR_DEFINE_UINT32(web_water_reflection_min_indices, 300, "Web",
+                      "Skip indexed draws with fewer indices than this in the water reflection "
+                      "(0 = draw everything)");
 
 namespace rex::system {
 namespace {
@@ -50,6 +69,17 @@ constexpr auto kFrameInterval = std::chrono::microseconds(16667);
 // Matches the WebGPU default maxTextureDimension2D.
 constexpr uint32_t kMaxImageDimension2D = 8192;
 constexpr size_t kCommandTypeCount = size_t(native::CommandType::kQueryTemporalUpscaler) + 1;
+
+// Per-frame timings for the page's diagnostics (rex_web_frame_timings): for
+// each of the last 256 presents, by present number, the game's own time for
+// the frame and the capture's time publishing it, in microseconds.
+constexpr uint32_t kTimingFrames = 256;
+struct FrameTimings {
+  std::atomic<uint32_t> presents{0};
+  uint32_t work_us[kTimingFrames] = {};
+  uint32_t publish_us[kTimingFrames] = {};
+};
+FrameTimings g_frame_timings;
 
 class NullGraphicsSystem final : public IGraphicsSystem {
  public:
@@ -116,12 +146,23 @@ class NullGraphicsSystem final : public IGraphicsSystem {
     const auto arrived = std::chrono::steady_clock::now();
     // The game's own time for the frame: from the last frame's completion to
     // this present (the pacing sleep below is not the game's).
+    const auto work = last_completed_.time_since_epoch().count() ? arrived - last_completed_
+                                                                  : std::chrono::steady_clock::duration{};
     if (last_completed_.time_since_epoch().count()) {
-      work_total_ += arrived - last_completed_;
+      work_total_ += work;
       work_frames_++;
     }
     graphics::web::OnPresent(&present, sizeof(present));
     const auto now = std::chrono::steady_clock::now();
+    {
+      auto us = [](auto d) {
+        return uint32_t(std::min<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(d).count(), UINT32_MAX));
+      };
+      const uint32_t n = g_frame_timings.presents.load(std::memory_order_relaxed);
+      g_frame_timings.work_us[n % kTimingFrames] = us(work);
+      g_frame_timings.publish_us[n % kTimingFrames] = us(now - arrived);
+      g_frame_timings.presents.store(n + 1, std::memory_order_release);
+    }
     if (next_frame_ > now && !REXCVAR_GET(web_uncapped_frames)) {
       std::this_thread::sleep_until(next_frame_);
     }
@@ -240,4 +281,10 @@ extern "C" rex::system::IGraphicsSystem* rex_gpu_create(uint32_t abi_version,
     return nullptr;
   }
   return new rex::system::NullGraphicsSystem();
+}
+
+// [web port] The page's diagnostics: the address of the per-frame timings
+// (u32 presents, then u32 work_us[256], then u32 publish_us[256]).
+extern "C" EMSCRIPTEN_KEEPALIVE void* rex_web_frame_timings() {
+  return &rex::system::g_frame_timings;
 }

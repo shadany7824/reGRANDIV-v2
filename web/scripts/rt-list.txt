@@ -31,6 +31,7 @@ src/core/mapped_memory_posix.cpp
 src/core/math_gcc.cpp
 src/core/memory.cpp
 src/core/memory_web.cpp
+src/core/fma_web.cpp
 src/core/mutex.cpp
 src/core/perf/counter.cpp
 src/core/platform/console_posix.cpp
