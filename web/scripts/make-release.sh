@@ -44,6 +44,28 @@ printf '#!/bin/bash\ncd "$(dirname "$0")" && exec python3 play.py "$@"\n' > "$ST
 printf '@echo off\r\ncd /d "%%~dp0"\r\nwhere py >nul 2>nul && (py -3 play.py %%*) || (python play.py %%*)\r\nif errorlevel 1 pause\r\n' \
   > "$STAGE/Play GTA IV.bat"
 chmod +x "$STAGE/Play GTA IV.command" "$STAGE/play.sh" "$STAGE/play.py"
+# The builder's home folder, which compiled-in source file names carry (log
+# and assert messages in gta4.wasm), out of everything published: replaced by
+# a name of the same length, so no string in the files changes size. Stops
+# if the account name is still anywhere after that.
+python3 -I - "$STAGE" "$HOME" "$(id -un)" <<'PY'
+import os, sys
+stage, home, user = sys.argv[1], sys.argv[2].encode(), sys.argv[3].encode()
+fill = (b"/home/player" + b"_" * len(home))[:len(home)] if len(home) >= 12 else b"/h" + b"_" * (len(home) - 2)
+changed = 0
+for root, _, names in os.walk(stage):
+    for name in names:
+        path = os.path.join(root, name)
+        data = open(path, "rb").read()
+        if home in data:
+            open(path, "wb").write(data.replace(home, fill))
+            changed += 1
+left = [os.path.join(r, n) for r, _, ns in os.walk(stage) for n in ns
+        if user.lower() in open(os.path.join(r, n), "rb").read().lower()]
+if left:
+    sys.exit("the account name is still in: " + ", ".join(left[:5]))
+print(f"home folder name replaced in {changed} files")
+PY
 cat > "$STAGE/README.txt" <<EOF
 GTA IV on the Web $VERSION - the Xbox 360 game, recompiled to run in your browser.
 
