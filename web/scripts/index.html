@@ -98,6 +98,27 @@
     const track = box.querySelector('.track'), fill = document.getElementById('fill');
     const detail = document.getElementById('detail'), stall = document.getElementById('stall');
     let lastNews = performance.now(), waitingForGame = -1;
+    // (the install's state: unknown until the game says; the menu's first frame
+    // can come long before that when the page is served over a slow connection)
+    let installKnown = false, menuShown = false;
+    // Bytes the game's file reads fetched (wasmfs_fetch.js), for the speed shown.
+    let netBytes = 0, netSamples = [];
+    new BroadcastChannel('gta4-net').onmessage = e => {
+      netBytes += e.data.dl;
+      netSamples.push([performance.now(), e.data.dl]);
+      lastNews = performance.now();
+    };
+    const netSpeed = () => {
+      const now = performance.now();
+      while (netSamples.length && now - netSamples[0][0] > 5000) netSamples.shift();
+      return netSamples.reduce((sum, s) => sum + s[1], 0) / 5 / 1048576;
+    };
+    const mbps = v => v >= 10 ? Math.round(v) + ' MB/s' : v.toFixed(1) + ' MB/s';
+    const menuSoon = () => {
+      if (!installKnown || !menuShown) return;
+      setTimeout(() => { if (waitingForGame < 0 && !box.classList.contains('failed')) hide(); }, 10000);
+    };
+    let downloadStart = 0;
     const show = (text, percent, more = '') => {
       box.hidden = false;
       box.classList.remove('failed');
@@ -123,24 +144,39 @@
       stall.textContent = `No news for ${Math.round(quiet)} s. The first launch can take several minutes: keep this tab open.`;
     }, 1000);
     return {
+      download(got, total) {
+        downloadStart = downloadStart || performance.now();
+        const seconds = (performance.now() - downloadStart) / 1000, speed = seconds > 1 ? got / seconds / 1048576 : 0;
+        const mb = v => (v / 1048576).toFixed(1);
+        show('Downloading the game engine', total ? got * 100 / total : null,
+             (total ? `${mb(got)} of ${mb(total)} MB` : `${mb(got)} MB`) + (speed ? ' · ' + mbps(speed) : '') +
+             (total && speed && got < total ? ` · about ${Math.ceil((total - got) / 1048576 / speed)} s left` : ''));
+      },
+      compiling() { show('Starting the game engine…', null); },
       note(text, isErr) {
         let m;
         if (/^ABORT: |this browser has no WebGPU|install FAILED/.test(text)) return fail(text.replace(/^ABORT: /, ''));
-        if (box.hidden && !/START GAME/.test(text)) return;
+        if (/already installed|install finished/.test(text)) { installKnown = true; menuSoon(); }
+        if (box.hidden && !/START GAME|is not installed|install: /.test(text)) return;
         if (text.startsWith('runtime initialized')) show('Loading…', null);
         else if (/is not installed/.test(text)) show('Installing GTA IV from your disc', 0, 'This happens once per browser.');
         else if ((m = text.match(/install: (\d+) \/ (\d+) MiB \((\d+)%\), ([\d.]+) MiB\/s/))) {
-          const [copied, total, percent, speed] = [+m[1], +m[2], +m[3], +m[4]];
+          const [copied, total, percent] = [+m[1], +m[2], +m[3]];
+          // (the speed of the last seconds' downloads when the disc comes over the network,
+          // else the install's average)
+          const speed = netSamples.length ? netSpeed() : +m[4];
           const left = speed > 0 ? Math.max(0, (total - copied) / speed) : 0;
-          show('Installing GTA IV from your disc', percent,
-               `${gb(copied)} of ${gb(total)} GB · ${Math.round(speed)} MB/s` +
-               (left >= 1 ? ` · about ${left < 60 ? Math.ceil(left) + ' s' : Math.ceil(left / 60) + ' min'} left` : ''));
+          const time = left < 60 ? Math.ceil(left) + ' s' : left < 5400 ? Math.ceil(left / 60) + ' min' : (left / 3600).toFixed(1) + ' h';
+          if (!total) show('Installing GTA IV from your disc', 0, 'Reading the disc' + (speed ? ' · ' + mbps(speed) : '') + '…');
+          else show('Installing GTA IV from your disc', percent,
+                    `${gb(copied)} of ${gb(total)} GB · ${mbps(speed)}` + (left >= 1 ? ` · about ${time} left` : ''));
         } else if (/install finished/.test(text)) show('Loading…', null, 'Installed.');
         // (the first frame comes while the hub's still loading its pictures:
         // the loading screen stays until the hub says it's ready, 10 s at most)
         else if (/web screen: first frame shown/.test(text)) {
           show('Loading the menu…', null);
-          setTimeout(() => { if (waitingForGame < 0) hide(); }, 10000);
+          menuShown = true;
+          menuSoon();
         } else if (/PS5 hub: installed |PS5 hub: .* Menu: playing/.test(text) && waitingForGame < 0) hide();
         else if (/START GAME/.test(text)) {
           show('Starting GTA IV…', null);
@@ -689,8 +725,65 @@
 <script src="record.js"></script>
 <script src="scene3d.js"></script>
 <script src="webui.js"></script>
-<script src="gta4.js"></script>
-<script src="gameinput.js"></script>
-<script src="demo.js"></script>
+<script>
+  // The engine, fetched by the page rather than by its own script tag, so a
+  // page served over the internet shows how far the download is and survives
+  // a dropped request: gta4.wasm with progress (served gzipped: about 14 MB),
+  // then gta4.js once, run from memory - its threads (one Web Worker each)
+  // start from that copy instead of each fetching it again, which over a slow
+  // or flaky connection took seconds per thread or failed ("Pthread sent an
+  // error", "waiting on run dependencies: loading-workers").
+  (() => {
+    const retried = async (what, url, read) => {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          const response = await fetch(url, { cache: 'no-cache' });
+          if (!response.ok) throw new Error('HTTP ' + response.status);
+          return await read(response);
+        } catch (e) {
+          if (attempt >= 6) throw new Error(`could not download ${what}: ${e.message || e}`);
+          line(`downloading ${what}: ${e.message || e}; trying again`, true);
+          await new Promise(r => setTimeout(r, 1000 * 2 ** attempt));
+        }
+      }
+    };
+    const wasm = retried('the game engine', 'gta4.wasm', async response => {
+      const total = +(response.headers.get('X-Uncompressed-Length') || 0) ||
+                    (response.headers.get('Content-Encoding') ? 0 : +(response.headers.get('Content-Length') || 0));
+      const reader = response.body.getReader(), parts = [];
+      let got = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parts.push(value);
+        got += value.length;
+        Loading.download(got, total);
+      }
+      const bytes = new Uint8Array(got);
+      let at = 0;
+      for (const part of parts) { bytes.set(part, at); at += part.length; }
+      return bytes;
+    });
+    Module.locateFile = path => new URL(path, location.href).href;
+    Module.instantiateWasm = (imports, done) => {
+      wasm.then(bytes => { Loading.compiling(); return WebAssembly.instantiate(bytes, imports); })
+          .then(result => done(result.instance, result.module))
+          .catch(e => Loading.note('ABORT: ' + (e.message || e)));
+      return {};
+    };
+    const run = src => new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = src;
+      script.onload = resolve;
+      script.onerror = () => reject(new Error('could not run ' + src));
+      document.body.appendChild(script);
+    });
+    retried('the game engine', 'gta4.js', response => response.text())
+      .then(code => run(URL.createObjectURL(new Blob([code], { type: 'text/javascript' }))))
+      .then(() => run('gameinput.js'))
+      .then(() => run('demo.js'))
+      .catch(e => Loading.note('ABORT: ' + (e.message || e)));
+  })();
+</script>
 </body>
 </html>

@@ -20,6 +20,7 @@ upload route is off then.
 Usage: serve.py <site dir> <iso path> <title update path> <rpf key path> [port]
 """
 
+import gzip
 import http.server
 import os
 import re
@@ -70,9 +71,26 @@ def listing(name):
 
 
 TYPES = {".wasm": "application/wasm", ".js": "text/javascript", ".html": "text/html"}
+# Sent gzipped to a browser that takes it (the engine: 66 -> 14 MB, a lot over
+# a home connection seen from elsewhere), compressed once per file version.
+COMPRESSED = {".wasm", ".js", ".html", ".wgsl", ".json", ".txt"}
+gzipped = {}
+gzip_lock = threading.Lock()
+
+
+def gzipped_copy(full, stat):
+    key = (full, stat.st_mtime_ns, stat.st_size)
+    with gzip_lock:
+        if key not in gzipped:
+            with open(full, "rb") as f:
+                gzipped[key] = gzip.compress(f.read(), 6)
+        return gzipped[key]
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    # (keep-alive: each engine thread, shader and disc range doesn't open a connection of its own)
+    protocol_version = "HTTP/1.1"
+
     def resolve(self):
         path = urllib.parse.unquote(self.path.split("?", 1)[0])
         for prefix, root in APP0.items():
@@ -95,22 +113,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
         full = os.path.abspath(os.path.join(SITE, path.lstrip("/")))
         return full if full.startswith(SITE + os.sep) and os.path.isfile(full) else None
 
-    def common_headers(self, ctype, length):
+    def common_headers(self, ctype, length, cache="no-store"):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
         self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
 
     def serve(self, body):
         full = self.resolve()
         if not full:
             self.send_error(404)
             return
-        size = os.path.getsize(full)
-        ctype = TYPES.get(os.path.splitext(full)[1], "application/octet-stream")
+        stat = os.stat(full)
+        size = stat.st_size
+        ext = os.path.splitext(full)[1]
+        ctype = TYPES.get(ext, "application/octet-stream")
+        # The site's own files: kept by the browser, asked again each time
+        # (unchanged: an empty 304), so each engine thread's script and a
+        # second visit's engine don't come over the network again.
+        site = full.startswith(SITE + os.sep)
+        cache = "no-cache" if site else "no-store"
+        etag = f'"{stat.st_mtime_ns:x}-{size:x}"'
+        if site and self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", cache)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if (body and site and ext in COMPRESSED and not self.headers.get("Range")
+                and "gzip" in self.headers.get("Accept-Encoding", "")):
+            data = gzipped_copy(full, stat)
+            self.send_response(200)
+            self.common_headers(ctype, len(data), cache)
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
+            self.send_header("X-Uncompressed-Length", str(size))
+            self.send_header("ETag", etag)
+            self.end_headers()
+            self.wfile.write(data)
+            return
         start, end = 0, size - 1
         match = re.match(r"bytes=(\d*)-(\d*)$", self.headers.get("Range", ""))
         if match and (match.group(1) or match.group(2)):
@@ -123,13 +168,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if start > end:
                 self.send_response(416)
                 self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
             self.send_response(206)
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         else:
             self.send_response(200)
-        self.common_headers(ctype, end - start + 1)
+        self.common_headers(ctype, end - start + 1, cache)
+        if site:
+            self.send_header("ETag", etag)
         self.end_headers()
         if not body:
             return

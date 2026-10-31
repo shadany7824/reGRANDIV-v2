@@ -23,7 +23,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <fcntl.h>
 #include <filesystem>
+#include <initializer_list>
 #include <string>
 #include <unistd.h>
 #include <thread>
@@ -60,6 +62,32 @@ bool MountFetched(const char* url, const char* path) {
   }
   Log(std::string("mounted ") + path + " from " + url);
   return true;
+}
+
+// A folder of files each fetched when read, from the folder's URL plus the
+// file's path in it: one backend, so one fetching thread for all of them
+// (a backend per file started a thread per file, each loading the engine's
+// script over the network first).
+void MountFetchedFolder(const char* url, const char* path, std::initializer_list<std::string> files) {
+  backend_t fetch = wasmfs_create_fetch_backend(url, kChunkSize);
+  if (wasmfs_create_directory(path, 0777, fetch) < 0) {
+    Log(std::string("could not mount ") + path);
+    return;
+  }
+  int mounted = 0;
+  for (const std::string& file : files) {
+    const std::string full = std::string(path) + "/" + file;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(full).parent_path(), ec);
+    const int fd = open(full.c_str(), O_CREAT | O_RDONLY, 0444);
+    if (fd < 0) {
+      Log("could not mount " + full);
+      continue;
+    }
+    close(fd);
+    mounted++;
+  }
+  Log(std::string("mounted ") + path + " from " + url + " (" + std::to_string(mounted) + " files)");
 }
 
 void InstallIfNeeded() {
@@ -175,47 +203,32 @@ extern "C" void rex_web_main_thread_init() {
   // The button-prompt sets (rpf_button_prompts: the keyboard's made by
   // tools/xtd_tools/build_keyboard_prompts.py, the PlayStation and Switch
   // sets' Controls pictures by build_controller_diagrams.py), where it looks
-  // for them; each file fetched only when the chosen set's is read.
-  wasmfs_create_directory("/game/button_prompts", 0777, root);
-  for (const char* set : {"keyboard", "xbox360", "xbox_one", "xbox_series_x", "ps3", "ps4", "ps5", "switch",
-                          "steam_deck", "steam_controller"}) {
-    const std::string dir = std::string("/game/button_prompts/") + set;
-    wasmfs_create_directory(dir.c_str(), 0777, root);
-    MountFetched((std::string("/prompts/") + set + "/buttons_360.xtd").c_str(), (dir + "/buttons_360.xtd").c_str());
-  }
-  for (const char* file : {"controls_foot.bin", "controls_vehicle.bin"}) {
-    MountFetched((std::string("/prompts/keyboard/") + file).c_str(),
-                 (std::string("/game/button_prompts/keyboard/") + file).c_str());
-  }
-  // (each set's Controls picture, put into the player's own frontend_360.xtd
-  // when the archive is built, and where it goes)
-  for (const char* set : {"keyboard", "ps3", "ps4", "ps5", "switch", "xbox_one", "xbox_series_x"}) {
-    MountFetched((std::string("/prompts/") + set + "/controller.bin").c_str(),
-                 (std::string("/game/button_prompts/") + set + "/controller.bin").c_str());
-  }
-  MountFetched("/prompts/controller-place.txt", "/game/button_prompts/controller-place.txt");
+  // for them; each file fetched only when the chosen set's is read. Each
+  // set's controller.bin is its Controls picture, put into the player's own
+  // frontend_360.xtd when the archive is built.
+  MountFetchedFolder("/prompts", "/game/button_prompts",
+                     {"keyboard/buttons_360.xtd", "xbox360/buttons_360.xtd", "xbox_one/buttons_360.xtd",
+                      "xbox_series_x/buttons_360.xtd", "ps3/buttons_360.xtd", "ps4/buttons_360.xtd",
+                      "ps5/buttons_360.xtd", "switch/buttons_360.xtd", "steam_deck/buttons_360.xtd",
+                      "steam_controller/buttons_360.xtd", "keyboard/controls_foot.bin",
+                      "keyboard/controls_vehicle.bin", "keyboard/controller.bin", "ps3/controller.bin",
+                      "ps4/controller.bin", "ps5/controller.bin", "switch/controller.bin",
+                      "xbox_one/controller.bin", "xbox_series_x/controller.bin", "controller-place.txt"});
 
   // The PS5 hub's app folder (ps5/package/hub and ps5/assets/fonts, which the
   // test server serves at /app0): the files it looks for, each fetched when read.
-  for (const char* dir : {"/app0", "/app0/hub", "/app0/hub/buttons", "/app0/hub/home",
-                          "/app0/hub/music", "/app0/hub/sfx", "/app0/fonts"}) {
-    wasmfs_create_directory(dir, 0777, root);
-  }
-  for (const char* file :
-       {"hub/buttons/Circle.png", "hub/buttons/Create.png", "hub/buttons/Cross.png",
-        "hub/buttons/D-Pad.png", "hub/buttons/L1.png", "hub/buttons/L2.png", "hub/buttons/L3.png",
-        "hub/buttons/Options.png", "hub/buttons/R1.png", "hub/buttons/R2.png", "hub/buttons/R3.png",
-        "hub/buttons/Square.png", "hub/buttons/Touch Pad.png", "hub/buttons/Triangle.png",
-        "hub/hero.jpg", "hub/home/gta4.jpg", "hub/home/tbogt-logo.png", "hub/home/tbogt.jpg",
-        "hub/home/tlad-logo.png", "hub/home/tlad.jpg", "hub/logo.png", "hub/music/GTA IV Menu.mp3",
-        "hub/music/The Ballad of Gay Tony Menu.mp3", "hub/music/The Lost and Damned Menu.mp3",
-        "hub/sfx/click.ogg", "hub/sfx/confirm.ogg", "hub/sfx/tab.ogg",
-        "fonts/inter-latin-400-normal.ttf", "fonts/inter-latin-600-normal.ttf",
-        "fonts/oswald-latin-600-normal.ttf", "fonts/oswald-latin-700-normal.ttf",
-        "fonts/texgyreheroscn-bold.otf", "fonts/texgyreheroscn-regular.otf"}) {
-    const std::string path = std::string("/app0/") + file;
-    MountFetched(path.c_str(), path.c_str());
-  }
+  wasmfs_create_directory("/app0", 0777, root);
+  MountFetchedFolder("/app0/hub", "/app0/hub",
+                     {"buttons/Circle.png", "buttons/Create.png", "buttons/Cross.png", "buttons/D-Pad.png",
+                      "buttons/L1.png", "buttons/L2.png", "buttons/L3.png", "buttons/Options.png",
+                      "buttons/R1.png", "buttons/R2.png", "buttons/R3.png", "buttons/Square.png",
+                      "buttons/Touch Pad.png", "buttons/Triangle.png", "hero.jpg", "home/gta4.jpg",
+                      "home/tbogt-logo.png", "home/tbogt.jpg", "home/tlad-logo.png", "home/tlad.jpg", "logo.png",
+                      "music/GTA IV Menu.mp3", "music/The Ballad of Gay Tony Menu.mp3",
+                      "music/The Lost and Damned Menu.mp3", "sfx/click.ogg", "sfx/confirm.ogg", "sfx/tab.ogg"});
+  MountFetchedFolder("/app0/fonts", "/app0/fonts",
+                     {"inter-latin-400-normal.ttf", "inter-latin-600-normal.ttf", "oswald-latin-600-normal.ttf",
+                      "oswald-latin-700-normal.ttf", "texgyreheroscn-bold.otf", "texgyreheroscn-regular.otf"});
   // The hub finds the game as on the PS5: <app>/UserData/LibertyRecomp, the
   // disc image, title update and episodes in <app>/install, and Xbox 360
   // saves in <app>/import.
