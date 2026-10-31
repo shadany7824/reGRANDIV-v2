@@ -1905,6 +1905,26 @@ void OnTitleCommand(uint32_t type, const void* command, size_t command_size) {
     case T::kRegisterVertexDeclaration: {
       if (command_size < sizeof(native::RegisterVertexDeclarationCommand)) return;
       const auto* c = static_cast<const native::RegisterVertexDeclarationCommand*>(command);
+      // A declaration made again at a freed one's address with other elements (a cutscene's peds after the
+      // intro's) gets a slot of its own: the page keeps each slot's layout and the pipelines built on it, and
+      // converted vertex buffers are cached by slot - reusing the slot drew the new heads with the old layout
+      // (their faces missing).
+      if (const auto found = g_decl_slots.find(c->declaration);
+          found != g_decl_slots.end() && g_decls.size() < g_decls.capacity()) {
+        const uint32_t count = std::min<uint32_t>(c->element_count, native::kMaximumVertexElementCount);
+        const auto& old = g_decl_views[found->second].elements;
+        if (old.size() == count && std::equal(c->elements, c->elements + count, old.begin(), [](const auto& a, const auto& b) {
+              return !std::memcmp(&a, &b, sizeof(a));
+            })) {
+          return;
+        }
+        static int logged = 0;
+        if (logged++ < 20) {
+          REXLOG_INFO("web: vertex declaration {:08X} made again with other elements ({} -> {}): slot {} -> {}",
+                      c->declaration, old.size(), count, found->second, g_decls.size());
+        }
+        g_decl_slots.erase(found);
+      }
       auto [slot, added] = g_decl_slots.try_emplace(c->declaration, uint32_t(g_decls.size()));
       if (added) {
         g_decls.emplace_back();
