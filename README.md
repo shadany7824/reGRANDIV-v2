@@ -1,10 +1,16 @@
-# GTA IV on the Web
+# reGRANDIV-v2 - GTA IV on the Web
 
 **Grand Theft Auto IV (Xbox 360) running in a web browser**: the real game, recompiled to WebAssembly, drawn with WebGPU, played from your own copy of the disc.
 
 Forked from here. Go support him. https://github.com/itzzace/gta4-web
 
 ![GTA IV's title over Liberty City, running in the browser](web/images/intro-title.jpg)
+
+# Link
+
+Discord: https://discord.gg/hrbcPjjZfj
+
+Telegram: https://t.me/reGRANDTA/
 
 > ### Built on Liberty Recompiled, LibertyRecompAndroid and the PS5 port
 > This is the work of **[OZORDI](https://github.com/OZORDI)** ([Liberty Recompiled](https://github.com/OZORDI/LibertyRecomp), the native recompilation of GTA IV), **[vaduur](https://github.com/vaduur)** ([LibertyRecompAndroid](https://github.com/vaduur/LibertyRecompAndroid)) and **[elripalda](https://github.com/elripalda)** ([the PS5 port](https://github.com/elripalda/gta4-ps5) and its hub), with **[ReXGlue](https://github.com/rexglue/rexglue-sdk)** underneath. The web port by **[itzzace](https://github.com/itzzace)** takes all of that into the browser.
