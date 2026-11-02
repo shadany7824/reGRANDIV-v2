@@ -7,7 +7,8 @@
 // rex_web_hub_pad (arrows / left stick: D-pad, Enter: Cross, Esc or
 // Backspace: Circle, X: Square, T: Triangle, Q / E: L1 / R1, O: Options), and
 // the mouse over the game's canvas (rex_web_hub_mouse: pointing focuses, a
-// click chooses, the wheel scrolls). The prompts show keys while the keyboard
+// click chooses, the wheel scrolls; on a touch screen a tap clicks and a swipe
+// scrolls). The prompts show keys while the keyboard
 // or mouse was used last, the controller's buttons after a gamepad.
 'use strict';
 window.WebUi = (() => {
@@ -61,6 +62,28 @@ window.WebUi = (() => {
       e.preventDefault();
     }
   }, { passive: false });
+  // A touch screen: a tap is a click already (the browser's mouse events for
+  // it); a finger dragged up or down scrolls, a wheel notch per 40 pixels of
+  // the overlay's, as the wheel would.
+  let swipe = null;
+  addEventListener('pointerdown', e => {
+    // (not over the game's touch controls: their sticks aren't swipes)
+    if (e.pointerType !== 'touch' || swipe || document.querySelector('#touch.on')) return;
+    const [x, y] = canvasPoint(e);
+    if (x >= 0 && y >= 0 && x < 1280 && y < 720) swipe = { id: e.pointerId, y };
+  });
+  addEventListener('pointermove', e => {
+    if (!swipe || e.pointerId !== swipe.id) return;
+    const [, y] = canvasPoint(e);
+    while (Math.abs(y - swipe.y) >= 40) {
+      const step = y < swipe.y ? 1 : -1;  // (the finger going up: the list moves on, as a wheel turned down)
+      mouse.wheel += step;
+      swipe.y -= step * 40;
+    }
+  });
+  const swipeEnd = e => { if (swipe && e.pointerId === swipe.id) swipe = null; };
+  addEventListener('pointerup', swipeEnd);
+  addEventListener('pointercancel', swipeEnd);
   function padBits() {
     let bits = 0;
     for (const code of held) bits |= keys[code];

@@ -10,7 +10,8 @@
   body { margin: 0; background: var(--bg); color: var(--fg); overflow: hidden;
          font: 15px/1.4 -apple-system, system-ui, "Segoe UI", sans-serif; }
   /* The game, as large as the window allows at 16:9, centred. */
-  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+           touch-action: none; }  /* (swipes are the hub's, not the page's to scroll or zoom) */
   #frame { position: relative; width: min(100vw, calc(100vh * 16 / 9)); aspect-ratio: 16 / 9; }
   #scene, #canvas { position: absolute; inset: 0; display: block; margin: 0; max-width: none;
                     width: 100% !important; height: 100% !important; background: #000; }
@@ -722,6 +723,9 @@
     }, 500);
   })();
 </script>
+<!-- (before the game: SDL looks for controllers when it starts, and the touch
+     controls are one) -->
+<script src="touchinput.js"></script>
 <script src="record.js"></script>
 <script src="scene3d.js"></script>
 <script src="webui.js"></script>
@@ -781,7 +785,6 @@
     retried('the game engine', 'gta4.js', response => response.text())
       .then(code => run(URL.createObjectURL(new Blob([code], { type: 'text/javascript' }))))
       .then(() => run('gameinput.js'))
-      .then(() => run('touchinput.js'))
       .then(() => run('demo.js'))
       .catch(e => Loading.note('ABORT: ' + (e.message || e)));
   })();

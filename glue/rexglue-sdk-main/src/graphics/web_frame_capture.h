@@ -187,5 +187,7 @@ void OnPresent(const void* present_command, size_t command_size);
 // The pause menu's Controls picture the keyboard set shows: 0 on foot, 1 in
 // a vehicle (as the page's labels; set by the title every frame).
 void SetControlsPicture(int picture);
+// A menu open (the pause menu, the map, the phone), for the page's touch controls.
+void SetMenuOpen(bool open);
 
 }  // namespace rex::graphics::web

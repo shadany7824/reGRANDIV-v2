@@ -30,7 +30,7 @@
     if (!started && Module._rex_web_game_key && (window.bootLog || []).some(l => l.includes('START GAME'))) started = true;
     return started;
   };
-  // Shared with touchinput.js, which shows its overlay once the game is running.
+  // (for other scripts: whether the game has started)
   window.rexGameRunning = gameRunning;
 
   const key = (e, down) => {

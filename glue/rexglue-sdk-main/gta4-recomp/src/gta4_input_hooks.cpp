@@ -932,6 +932,7 @@ void ProcessPauseTabShoulders(PPCContext& parent, uint8_t* base,
   // [web port] The keyboard set's Controls picture follows the page's labels:
   // in a vehicle or on foot (web_frame_capture.cpp SetControlsPicture).
   rex::graphics::web::SetControlsPicture(ReadVehicleInputContext(base).vehicle != 0);
+  rex::graphics::web::SetMenuOpen(epoch.frontend_active || epoch.phone_visible);
 #endif
   if ((!epoch.valid && !epoch.gamepad_valid) ||
       g_pause_tab_input.epoch == epoch.sequence) {

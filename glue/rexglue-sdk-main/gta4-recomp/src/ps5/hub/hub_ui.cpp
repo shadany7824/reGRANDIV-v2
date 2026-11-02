@@ -228,8 +228,8 @@ static const std::vector<Hub::Setting>& Settings() {
       {"GAME", "gta4_button_prompts", "Button Prompts", nullptr,
        "The pictures in the game's help messages. Auto uses the controller you play with, or the keyboard's "
        "keys when there is none. Applies when the game starts.",
-       true, {"auto", "keyboard", "xbox360", "xbox_series_x", "ps5", "switch"},
-       {"Auto", "Keyboard & Mouse", "Xbox 360", "Xbox Series", "PlayStation", "Switch"}, "auto"},
+       true, {"auto", "keyboard", "touch", "xbox360", "xbox_series_x", "ps5", "switch"},
+       {"Auto", "Keyboard & Mouse", "Touch", "Xbox 360", "Xbox Series", "PlayStation", "Switch"}, "auto"},
 #endif
       {"GAME", "gta4_skip_intro", "Skip Intro", nullptr,
        "Goes straight to the game's start screen, past the logos and the legal screens.", false,
@@ -940,7 +940,7 @@ struct PromptStyle {
 };
 PromptStyle StyleFor(const std::string& chosen) {
   if (chosen == "keyboard") return {true, PadFamily::kXbox};
-  if (chosen.rfind("xbox", 0) == 0 || chosen == "steam_deck" || chosen == "steam_controller")
+  if (chosen.rfind("xbox", 0) == 0 || chosen == "touch" || chosen == "steam_deck" || chosen == "steam_controller")
     return {false, PadFamily::kXbox};
   if (chosen.rfind("ps", 0) == 0) return {false, PadFamily::kPlayStation};
   if (chosen == "switch") return {false, PadFamily::kNintendo};

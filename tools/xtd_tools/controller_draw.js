@@ -4,7 +4,7 @@ ObjC.import('AppKit');
 // starting at the rows the game prints its labels at (the Xbox 360
 // picture's: left edge LT LB guide back LS L3 up left down right, right edge
 // RT RB Y B A X RS R3 start) and running to that controller's control.
-// Usage: osascript -l JavaScript controller_draw.js <out.png> <ps|xbox|switch>
+// Usage: osascript -l JavaScript controller_draw.js <out.png> <ps|xbox|switch|keys_foot|keys_vehicle|touch>
 function run(argv) {
   const [output, style] = argv;
   const size = 512;
@@ -100,6 +100,67 @@ function run(argv) {
       const w = Math.max(30, label.length * 9 + 14);
       cap(leftSide ? x + w / 2 : x - w / 2, y, label);
     }
+    $.NSGraphicsContext.restoreGraphicsState;
+    rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({})).writeToFileAtomically(output, true);
+    return 'ok';
+  }
+
+  // The touch controls (web/scripts/touchinput.js): a phone on its side with
+  // the buttons the page shows on foot, where it shows them, each row's line
+  // ending at that button. Positions as touchinput.js has them, in hundredths
+  // of the screen's height from its edges (x < 0: from the right, a string:
+  // from the middle).
+  if (style === 'touch') {
+    // (the pause menu shows the picture down to about y 325: the phone fits above that)
+    const sx = 91, sy = 118, sw = 330, sh = 330 * 9 / 16, u = sh / 100;
+    const at = ([x, y]) => [typeof x === 'string' ? sx + sw / 2 + +x * u : x < 0 ? sx + sw + x * u : sx + x * u, sy + sh - y * u];
+    // the phone and its screen
+    fillStroke(rounded(sx + sw / 2, sy + sh / 2, sw + 34, sh + 22, 26), rgb(30, 30, 33), black, 5);
+    fillStroke(rounded(sx + sw / 2, sy + sh / 2, sw, sh, 8), rgb(70, 78, 86), black, 2);
+    fillStroke(rounded(sx + sw / 2, sy + sh * 0.78, sw - 4, sh * 0.42, 6), rgb(58, 62, 64), null);
+    fillStroke(oval(sx - 9, sy + sh / 2, 3), rgb(60, 60, 64), null);
+    const stick = at([46, 24]), stickR = 14 * u, look = at([-62, 34]);
+    const C = {
+      rt: at([-16, 21]), lt: at([-39, 13]), x: at([-12, 46]), y: at([-31, 38]), b: at([-29, 57]),
+      rb: at([-12, 63]), lb: at([23, 80]), r3: at([-46, 44]), l3: at([64, 9]), up: at([9, 80]),
+      left: at([9, 66]), right: at([23, 66]), back: at(['-9', 88]), start: at(['9', 88]),
+      run: [stick[0] + stickR * 0.7, stick[1] - stickR * 0.7],
+    };
+    const left = [[53, C.lt], [80, C.lb], [135.5, C.back], [162, stick], [189, C.l3],
+      [216, C.up], [243, C.left], [297.5, C.right]];
+    const right = [[53, C.rt], [80, C.rb], [134.5, C.y], [162, C.b], [189, C.run], [216, C.x], [243, look],
+      [270, C.r3], [297.5, C.start]];
+    const lead = (row, anchor, leftSide) => {
+      const edge = leftSide ? 0 : size, elbow = leftSide ? 38 : size - 38;
+      // (AIM's row runs level above the phone and drops to it past the
+      // others; PAUSE's goes round the phone's right end and over its top)
+      if (anchor === C.lt || anchor === C.rt) return [[edge, row], [anchor[0], row], anchor];
+      if (anchor === C.start) return [[edge, row], [size - 24, row], [size - 24, 104], [anchor[0], 104], anchor];
+      return [[edge, row], [elbow, row], anchor];
+    };
+    const leads = left.map(([row, a]) => lead(row, a, true)).concat(right.map(([row, a]) => lead(row, a, false)));
+    for (const points of leads) fillStroke(poly(points, false), null, black, 6);
+    for (const points of leads) fillStroke(poly(points, false), null, lineGrey, 2);
+    // the stick, its edge (running) in green; the camera's drag
+    fillStroke(oval(...stick, stickR), rgb(20, 20, 22, 0.55), light, 2);
+    fillStroke(oval(...stick, 6 * u), rgb(200, 200, 205), null);
+    fillStroke(oval(...C.run, 2.4), rgb(143, 220, 90), black, 1);
+    fillStroke(oval(...look, 9 * u), null, rgb(200, 200, 205, 0.7), 1.5);
+    text('↔', look[0], look[1] - 1, 13, light);
+    const round = (p, d, label, fontSize) => {
+      fillStroke(oval(...p, d * u / 2), rgb(16, 16, 18), light, 2);
+      text(label, p[0], p[1] + 0.5, fontSize, light);
+    };
+    const flat = (p, w, label, fontSize) => {
+      fillStroke(rounded(...p, w * u, Math.min(w, 9) * 0.8 * u, 2 * u), rgb(16, 16, 18), light, 1.6);
+      text(label, p[0], p[1] + 0.5, fontSize, light);
+    };
+    round(C.rt, 20, 'FIRE', 9); round(C.lt, 15, 'AIM', 8); round(C.x, 13, 'JUMP', 6.5);
+    round(C.y, 12, 'ENTER', 5.5); round(C.b, 10, 'RELOAD', 4.2); round(C.r3, 9, 'BACK', 4.5);
+    round(C.l3, 10, 'CROUCH', 4.2);
+    flat(C.rb, 11, 'COVER', 5.5); flat(C.lb, 9, 'PICK UP', 4); flat(C.up, 9, 'PHONE', 4.5);
+    flat(C.left, 9, '◀ GUN', 4.5); flat(C.right, 9, 'GUN ▶', 4.5);
+    flat(C.back, 8, 'CAMERA', 3.8); flat(C.start, 8, 'PAUSE', 4);
     $.NSGraphicsContext.restoreGraphicsState;
     rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({})).writeToFileAtomically(output, true);
     return 'ok';

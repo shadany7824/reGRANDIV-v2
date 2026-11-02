@@ -9,7 +9,8 @@ button-prompt set
 (rpf_button_prompts.cpp mounts it beside that set's buttons_360.xtd).
 
 Usage: build_controller_diagrams.py <xtd_store binary> <frontend_360.xtd> <out root> [work dir]
-writes <out root>/<variant>/frontend_360.xtd for each variant below, and the
+writes <out root>/<variant>/frontend_360.xtd for each variant below (ONLY=a,b:
+just those), and the
 pictures alone, to ship without the game's textures: <variant>/controller.bin
 (the tiled texture) and controller-place.txt (where it goes in the unpacked
 dictionary, and the stock picture's SHA-256), which rpf_button_prompts.cpp
@@ -18,6 +19,7 @@ BuildFrontend writes into the player's own frontend_360.xtd.
 
 import hashlib
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -26,7 +28,7 @@ HERE = Path(__file__).resolve().parent
 
 # Prompt set -> controller_draw.js style.
 VARIANTS = {"ps3": "ps", "ps4": "ps", "ps5": "ps", "switch": "switch", "xbox_one": "xbox", "xbox_series_x": "xbox",
-            "keyboard": "keys_foot"}
+            "keyboard": "keys_foot", "touch": "touch"}
 # (the keyboard's two pictures, on foot and in a vehicle, also as the tiled
 # texture bytes the web build copies over the loaded one when the page
 # changes between them: web_frame_capture.cpp SetControlsPicture)
@@ -84,7 +86,10 @@ def main() -> int:
     place.parent.mkdir(parents=True, exist_ok=True)
     place.write_text(f"{at} {hashlib.sha256(base[at:at + size]).hexdigest()}\n")
     print("wrote", place)
+    only = set(filter(None, os.environ.get("ONLY", "").split(",")))
     for variant, style in VARIANTS.items():
+        if only and variant not in only:
+            continue
         tiled = tiled_picture(style)
         (out_root / variant).mkdir(parents=True, exist_ok=True)
         (out_root / variant / "controller.bin").write_bytes(tiled)

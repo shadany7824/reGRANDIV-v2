@@ -722,6 +722,9 @@ struct ControlsPictures {
 };
 ControlsPictures g_controls;
 std::atomic<int> g_controls_wanted{0};
+// (a menu open: the pause menu, the map, the phone; the page's touch
+// controls show the buttons for menus then)
+std::atomic<int> g_menu_open{0};
 
 // (all of it: the pictures' first blocks are the same empty corner)
 uint64_t ControlsHash(const uint8_t* bytes) { return XXH3_64bits(bytes, 256 * 1024); }
@@ -2000,6 +2003,8 @@ void OnTitleCommand(uint32_t type, const void* command, size_t command_size) {
   }
 }
 
+void SetMenuOpen(bool open) { g_menu_open.store(open ? 1 : 0, std::memory_order_relaxed); }
+
 void SetControlsPicture(int picture) {
   if (g_controls_wanted.exchange(picture ? 1 : 0, std::memory_order_relaxed) != (picture ? 1 : 0))
     REXLOG_INFO("web controls picture: now {}", picture ? "in a vehicle" : "on foot");
@@ -2194,6 +2199,13 @@ extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_set_option(int option, int value) {
   if (option == 5) g_option_float_targets = value;
   g_texture_lookup.clear();
   for (auto& slot : g_texture_slots) slot.key = 0;
+}
+
+// Where the player is, for the page's touch controls (touchinput.js): bit 0
+// in a vehicle (as the Controls picture follows it), bit 1 a menu or the phone open.
+extern "C" EMSCRIPTEN_KEEPALIVE int rex_web_play_state() {
+  return rex::graphics::web::g_controls_wanted.load(std::memory_order_relaxed) |
+         rex::graphics::web::g_menu_open.load(std::memory_order_relaxed) << 1;
 }
 
 // The game's presents so far (the page's FPS counter: game frames a second).

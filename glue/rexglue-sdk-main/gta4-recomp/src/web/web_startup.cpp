@@ -210,10 +210,11 @@ extern "C" void rex_web_main_thread_init() {
                      {"keyboard/buttons_360.xtd", "xbox360/buttons_360.xtd", "xbox_one/buttons_360.xtd",
                       "xbox_series_x/buttons_360.xtd", "ps3/buttons_360.xtd", "ps4/buttons_360.xtd",
                       "ps5/buttons_360.xtd", "switch/buttons_360.xtd", "steam_deck/buttons_360.xtd",
-                      "steam_controller/buttons_360.xtd", "keyboard/controls_foot.bin",
+                      "steam_controller/buttons_360.xtd", "touch/buttons_360.xtd", "keyboard/controls_foot.bin",
                       "keyboard/controls_vehicle.bin", "keyboard/controller.bin", "ps3/controller.bin",
                       "ps4/controller.bin", "ps5/controller.bin", "switch/controller.bin",
-                      "xbox_one/controller.bin", "xbox_series_x/controller.bin", "controller-place.txt"});
+                      "xbox_one/controller.bin", "xbox_series_x/controller.bin", "touch/controller.bin",
+                      "controller-place.txt"});
 
   // The PS5 hub's app folder (ps5/package/hub and ps5/assets/fonts, which the
   // test server serves at /app0): the files it looks for, each fetched when read.

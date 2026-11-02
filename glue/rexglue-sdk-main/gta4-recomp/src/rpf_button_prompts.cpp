@@ -37,7 +37,7 @@ extern "C" {
 
 REXCVAR_DEFINE_STRING(gta4_button_prompts, "auto", "GTA IV/Controls",
                       "Button prompt pictures: auto (the controller found, else keyboard keys in the "
-                      "browser), keyboard, xbox360, xbox_one, xbox_series_x, ps3, ps4, ps5, switch, "
+                      "browser), keyboard, touch, xbox360, xbox_one, xbox_series_x, ps3, ps4, ps5, switch, "
                       "steam_deck or steam_controller");
 
 namespace gta4::button_prompts {
@@ -484,7 +484,11 @@ std::string SelectVariant() {
   SDL_free(gamepads);
 
   std::string variant = "xbox360";
-  if (lower_name.contains("steam deck")) {
+  if (lower_name.contains("touch controls") && FindAsset("touch")) {
+    // [web port] The page's on-screen controller (touchinput.js): the Xbox
+    // 360's buttons, and a Controls picture of the touch layout.
+    variant = "touch";
+  } else if (lower_name.contains("steam deck")) {
     variant = "steam_deck";
   } else if (lower_name.contains("steam controller")) {
     variant = "steam_controller";
@@ -825,7 +829,7 @@ bool MountArchive(rex::Runtime& runtime, const std::filesystem::path& archive) {
 std::optional<std::string> GuideLabel(std::string_view variant) {
   if (variant == "ps3" || variant == "ps4" || variant == "ps5") return "PS";
   if (variant == "switch") return "HOME";
-  if (variant == "keyboard") return "";  // (no line on the keyboard picture)
+  if (variant == "keyboard" || variant == "touch") return "";  // (no line on their pictures)
   return std::nullopt;
 }
 
