@@ -21,11 +21,13 @@
 
 namespace fs = std::filesystem;
 
-// (a synchronous request: fine on a worker, which everything here runs on)
+// (a synchronous request: fine on a worker, which everything here runs on.
+// The URL is made whole from the page's origin: the workers run gta4.js from a
+// blob: URL (index.html), against which "/host/..." isn't an address.)
 EM_JS(int, rex_web_host_request, (const char* method, const char* url, char* out, int capacity), {
   try {
     const xhr = new XMLHttpRequest();
-    xhr.open(UTF8ToString(Number(method)), UTF8ToString(Number(url)), false);
+    xhr.open(UTF8ToString(Number(method)), new URL(UTF8ToString(Number(url)), self.location.origin).toString(), false);
     xhr.send();
     if (xhr.status < 200 || xhr.status >= 300) return -1;
     const text = xhr.responseText || "";
