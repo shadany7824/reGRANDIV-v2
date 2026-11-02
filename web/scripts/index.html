@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <title>GTA IV</title>
 <style>
   :root { --bg: #000; --fg: #ddd; --dim: #888; --err: #ff8a80; --accent: #f0b030; --panel: rgba(12, 12, 12, 0.92); }
@@ -781,6 +781,7 @@
     retried('the game engine', 'gta4.js', response => response.text())
       .then(code => run(URL.createObjectURL(new Blob([code], { type: 'text/javascript' }))))
       .then(() => run('gameinput.js'))
+      .then(() => run('touchinput.js'))
       .then(() => run('demo.js'))
       .catch(e => Loading.note('ABORT: ' + (e.message || e)));
   })();

@@ -18,7 +18,7 @@ fi
 rm -rf "${STAGE:?}" "$OUT/$NAME.zip"
 mkdir -p "$STAGE/web/scripts" "$STAGE/web/build/link" "$STAGE/ps5/package" "$STAGE/ps5/assets" \
          "$STAGE/LibertyRecompLib" "$STAGE/game-files"
-for f in index.html check.html record.js scene3d.js webui.js gameinput.js demo.js gta4.js gta4.wasm \
+for f in index.html check.html record.js scene3d.js webui.js gameinput.js touchinput.js demo.js gta4.js gta4.wasm \
          scene3d-pipelines.json; do
   cp "$LINK/$f" "$STAGE/web/build/link/"
 done
