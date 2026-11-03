@@ -58,6 +58,11 @@ void AndroidShutdown();
 // Returns the native page size of the system, in bytes.
 // This should be ~4KiB.
 size_t page_size();
+#ifdef __EMSCRIPTEN__
+// [web port] Zeroes a range, writing only its pages that aren't zero already
+// (a written page of linear memory stays committed: memory_web.cpp).
+void ZeroRange(void* base, size_t length);
+#endif
 
 // Returns the allocation granularity of the system, in bytes.
 // This is likely 64KiB.

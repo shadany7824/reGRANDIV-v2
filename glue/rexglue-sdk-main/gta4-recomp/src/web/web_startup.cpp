@@ -34,6 +34,8 @@
 #include <emscripten/wasmfs.h>
 #include <sys/stat.h>
 
+#include <rex/chrono/clock.h>
+
 #include "install/gta4_installer.h"
 
 // Reports guest threads stuck in a kernel wait (core/ps5_diag_web.cpp).
@@ -189,6 +191,9 @@ extern "C" void rex_web_main_thread_init() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   std::setvbuf(stderr, nullptr, _IONBF, 0);
   rex_web_start_wait_monitor();
+  // (the clock's millisecond count: reads within one millisecond reuse the
+  // last, clock_posix.cpp)
+  rex::chrono::StartWebClockTicker();
 
   backend_t root = wasmfs_get_backend_by_path("/");
   for (const char* dir : {"/home", "/home/web_user", "/home/web_user/.local",

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 
@@ -27,6 +28,14 @@ REXCVAR_DECLARE(bool, clock_source_raw);
 #endif
 
 namespace rex::chrono {
+
+#if defined(__EMSCRIPTEN__)
+// [web port] A count bumped each millisecond once StartWebClockTicker has run:
+// a thread reading the clock again within the same one reuses its last
+// reading (clock_posix.cpp host_tick_count_platform).
+std::atomic<uint32_t>& WebClockEpoch();
+void StartWebClockTicker();
+#endif
 
 class Clock {
  public:

@@ -350,6 +350,11 @@ void ImGuiDrawer::SetupFontTexture() {
   font_texture_ = immediate_drawer_->CreateTexture(width, height, ImmediateTextureFilter::kLinear,
                                                    true, reinterpret_cast<uint8_t*>(pixels));
   io.Fonts->TexID = reinterpret_cast<ImTextureID>(font_texture_.get());
+#if defined(__EMSCRIPTEN__)
+  // [web port] The texture has its own copy (until the page uploads it): the
+  // atlas's 32 MB of pixels aren't needed again (the fonts are made once).
+  io.Fonts->ClearTexData();
+#endif
 }
 
 void ImGuiDrawer::SetPresenter(Presenter* new_presenter) {

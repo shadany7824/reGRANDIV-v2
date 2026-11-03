@@ -26,7 +26,9 @@
 
 REXCVAR_DEFINE_BOOL(gta4_stale_object_guard, true, "GTA IV/Stability",
                     "Treat an object whose pointers lead to unmapped memory as absent in "
-                    "sub_8296E480, sub_8296E310, sub_8297CE78 and sub_82477E30 instead of crashing");
+                    "sub_8296E480, sub_8296E310, sub_8297CE78 and sub_82477E30 instead of crashing, "
+                    "and reset sub_8296E638's entry count when it is garbage and skip sub_8294EC18's unlink of an "
+                    "entry its chain doesn't hold, instead of looping");
 
 namespace {
 
@@ -134,6 +136,62 @@ extern "C" bool GTA4_StaleChildGuard(uint32_t child) {
                         static_cast<unsigned long long>(count), child);
   }
   return false;
+}
+
+// sub_8296E638 (an object's physics update) first walks its entry table: the
+// count at +1184 of 176-byte entries held in the object itself (+128 up to
+// +1184: six at most), then works through them. A freed object's garbage
+// count made it loop for ever - the game frozen, one thread at 100% - after a
+// car landed on a rooftop (2026-11-03). A count no table that size can hold
+// takes the title's own reset (loc_8296E7C0: count 0, +1188 -1) before the
+// call, as for a fresh object.
+extern "C" void sub_8296E638(PPCContext& ctx, uint8_t* base) {
+  const uint32_t object = ctx.r3.u32;
+  if (REXCVAR_GET(gta4_stale_object_guard) && Readable(object + 1184, 8)) {
+    const uint32_t count = REX_LOAD_U32(object + 1184);
+    if (count > 16) {
+      const uint64_t n = g_stale_objects.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || !(n % 1024)) {
+        StaleLog("stale-object-guard: #%llu sub_8296E638 object=%08X count=%08X", static_cast<unsigned long long>(n),
+                 object, count);
+      }
+      REX_STORE_U32(object + 1184, 0);
+      REX_STORE_U32(object + 1188, 0xFFFFFFFFu);
+    }
+  }
+  __imp__sub_8296E638(ctx, base);
+}
+
+// sub_8294EC18(pool r3, bucket r4, entry r5) unlinks entry r5 from a bucket's
+// chain: it follows the 16-bit links (the first at pool->[140] + bucket*64 +
+// 26, then table pool->[112] + link*8) until it meets r5, with no end test.
+// A freed object's entry is in no chain, and the walk then circles for ever:
+// the game frozen, one thread at 100%, after a car landed on a rooftop
+// (2026-11-03). The chain is walked first, bounded; an entry it doesn't reach
+// is left alone (nothing to unlink).
+extern "C" void sub_8294EC18(PPCContext& ctx, uint8_t* base) {
+  if (REXCVAR_GET(gta4_stale_object_guard)) {
+    const uint32_t pool = ctx.r3.u32, bucket = ctx.r4.u32, entry = ctx.r5.u32 & 0xFFFF;
+    bool found = false;
+    if (Readable(pool + 112, 4) && Readable(pool + 140, 4)) {
+      const uint32_t table = REX_LOAD_U32(pool + 112);
+      uint32_t link = REX_LOAD_U32(pool + 140) + (bucket << 6) + 26;
+      // (a chain holds at most the pool's 65536 entries)
+      for (uint32_t steps = 0; steps <= 0x10000 && Readable(link, 2); steps++) {
+        const uint32_t next = REX_LOAD_U16(link);
+        if (next == entry) { found = true; break; }
+        link = table + (next << 3);
+      }
+    }
+    if (!found) {
+      const uint64_t n = g_stale_objects.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || !(n % 1024))
+        StaleLog("stale-object-guard: #%llu sub_8294EC18 pool=%08X bucket=%u entry=%04X not in its chain",
+                 static_cast<unsigned long long>(n), pool, bucket, entry);
+      return;
+    }
+  }
+  __imp__sub_8294EC18(ctx, base);
 }
 
 extern "C" void sub_8296E480(PPCContext& ctx, uint8_t* base) {

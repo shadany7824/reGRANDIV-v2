@@ -11,6 +11,7 @@
 
 #include <rex/platform.h>
 #if REX_PLATFORM_WEB
+#include <rex/memory/utils.h>
 #include <rex/memory/web_layout.h>
 #endif
 #if REX_PLATFORM_PS5
@@ -665,7 +666,13 @@ uint32_t Memory::GetPhysicalAddress(uint32_t address) const {
 }
 
 void Memory::Zero(uint32_t address, uint32_t size) {
+#ifdef __EMSCRIPTEN__
+  // (committed guest memory is zeroed here: on the web only the pages that
+  // need it are written, so what the title commits and never uses stays free)
+  rex::memory::ZeroRange(TranslateVirtual(address), size);
+#else
   std::memset(TranslateVirtual(address), 0, size);
+#endif
 }
 
 void Memory::Fill(uint32_t address, uint32_t size, uint8_t value) {

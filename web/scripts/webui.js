@@ -168,6 +168,8 @@ window.WebUi = (() => {
         { bytesPerRow: w * 4 }, [w, h]);
       const entry = { texture: tex, view: tex.createView(), linear };
       textures.set(id, entry);
+      // (the game lets its copy of the pixels go)
+      Module._rex_web_ui_texture_uploaded?.(id);
       return entry;
     }
     return white;
@@ -231,6 +233,13 @@ window.WebUi = (() => {
       const draws = Number(m.getBigUint64(frame + 32, true));
       const width = m.getFloat32(frame + 40, true) || 1280, height = m.getFloat32(frame + 44, true) || 720;
       const textureCount = m.getUint32(frame + 48, true), table = Number(m.getBigUint64(frame + 56, true));
+      // Now and then: textures the game has let go of (the hub's pictures once
+      // the game starts) leave the GPU too.
+      if (lastSequence % 120 === 0 && textures.size > textureCount) {
+        const live = new Set();
+        for (let i = 0; i < textureCount; i++) live.add(m.getUint32(table + i * 24, true));
+        for (const [id, t] of textures) if (!live.has(id)) { t.texture.destroy(); textures.delete(id); }
+      }
       Object.assign(webUiStats, { sequence: lastSequence, draws: drawCount, vertices: vertexCount, textures: textureCount });
       if (!clear && !drawCount) return;
       const pass = encoder.beginRenderPass({ colorAttachments: [{ view, loadOp: clear ? 'clear' : 'load',

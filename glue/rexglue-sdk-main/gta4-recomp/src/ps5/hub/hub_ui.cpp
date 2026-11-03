@@ -333,7 +333,7 @@ static const std::vector<Hub::Setting>& Settings() {
   // the help text for a browser.
   static const std::vector<Hub::Setting> web_rows = [] {
     static const std::string_view kHidden[] = {
-        "resolution", "ps5_refresh_rate", "gta4_frame_limit", "ps5_fps_counter", "ps5_frame_generation",
+        "resolution", "ps5_refresh_rate", "ps5_fps_counter", "ps5_frame_generation",
         "gta4_native_anti_aliasing", "gta4_anisotropic_filtering", "gta4_modern_shaders", "ps5_audio_frames",
         "gta4_sony_enabled", "gta4_sony_lighting", "gta4_sony_triggers", "gta4_sony_rumble", "gta4_sony_intensity"};
     std::vector<Hub::Setting> out;
@@ -344,6 +344,18 @@ static const std::vector<Hub::Setting>& Settings() {
         r.help = "Sets the Display settings below in one go. Recommended is the game as it comes. Performance "
                  "has fewer cars and people, for the steadiest frame rate in the browser. Quality adds longer "
                  "shadows and more detail in the distance. Changing any of them makes it Custom.";
+      } else if (key == "gta4_frame_limit") {
+        // (30 or 60 here: the browser shows at most the screen's 60)
+        r.help = "The most frames a second the game draws. 30 is what the Xbox 360 aimed for: it holds "
+                 "steady on a slower computer, a Chromebook or a phone and does half the work, so it runs "
+                 "cooler and saves battery. 60 is smoother where the computer keeps up.";
+        r.values = {"30", "60"};
+        r.labels = {"30 FPS", "60 FPS"};
+      } else if (key == "gta4_shadow_map_base_size") {
+        r.help = "How sharp shadows are. Original is the Xbox 360's and the lightest; High is twice its detail; "
+                 "Very High doubles it again and asks more of the graphics card.";
+        r.values = {"256", "512", "1024"};
+        r.labels = {"Original", "High", "Very High"};
       } else if (key == "ps5_language") {
         r.help = "The language of the game's text (menus, subtitles and missions) and of this menu. Auto is "
                  "English in the browser. Voices stay in English, as on the Xbox 360.";
@@ -2071,8 +2083,14 @@ void Hub::ApplyWebDeviceDefaults() {
   if (!Value("web_device_defaults", "").empty()) return;
   const int threads = EM_ASM_INT({ return navigator.hardwareConcurrency | 0; });
   const int memory_tenths = EM_ASM_INT({ return Math.round((navigator.deviceMemory || 0) * 10); });
+  // (a phone or a tablet, or a Chromebook: their cores are slower and their
+  // memory shared with the graphics, whatever the counts say)
+  const bool handheld = EM_ASM_INT({
+    const ua = navigator.userAgent;
+    return /Android|Mobile|CrOS/.test(ua) || !!(navigator.userAgentData && navigator.userAgentData.mobile);
+  });
   std::string tier = "high";
-  if ((threads && threads <= 4) || (memory_tenths && memory_tenths <= 40)) {
+  if (handheld || (threads && threads <= 4) || (memory_tenths && memory_tenths <= 40)) {
     tier = "low";
   } else if (threads && threads <= 8) {
     tier = "medium";
@@ -2090,6 +2108,10 @@ void Hub::ApplyWebDeviceDefaults() {
   static const Default kDefaults[] = {
       {"low", "gta4_draw_distance_scale", "0.75"},
       {"low", "ps5_population", "0.5"},
+      // (the Xbox 360's shadows and reflections, and its 30 frames a second)
+      {"low", "gta4_shadow_map_base_size", "256"},
+      {"low", "gta4_reflection_resolution", "\"original\""},
+      {"low", "gta4_frame_limit", "30"},
       {"medium", "gta4_draw_distance_scale", "0.75"},
       {"medium", "ps5_population", "0.75"},
   };

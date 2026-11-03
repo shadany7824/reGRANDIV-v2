@@ -45,7 +45,7 @@ uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
 // Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
 std::mutex tick_mutex_;
 
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5: no lock to read the clock
 // [ps5 port] The guest clock as a function of the host's: guest ticks at a
 // host tick are guest_base + (host - host_base) * numerator / denominator.
 // Every mftb read took tick_mutex_ (a system call when another thread held
@@ -78,7 +78,7 @@ void RecomputeGuestTickScalar() {
   reduce_fraction(frac);
 
   std::lock_guard<std::mutex> lock(tick_mutex_);
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5: no lock to read the clock
   // Continue the guest clock from where it is now, at the new rate.
   const uint64_t host_now = Clock::QueryHostTickCount();
   uint64_t guest_now;
@@ -111,7 +111,7 @@ uint64_t UpdateGuestClock() {
     return host_tick_count * guest_tick_ratio_.first / guest_tick_ratio_.second;
   }
 
-#if REX_PLATFORM_PS5
+#if REX_PLATFORM_PS5 || REX_PLATFORM_WEB  // [web port] as on the PS5: no lock to read the clock
   if (const GuestClockMapping* mapping = guest_clock_mapping_.load(std::memory_order_acquire)) {
     return GuestTicksAt(*mapping, host_tick_count);
   }

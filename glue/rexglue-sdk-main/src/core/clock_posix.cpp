@@ -17,6 +17,13 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #ifdef __APPLE__
 #include <mach/mach_time.h>
 #endif
+#if defined(__EMSCRIPTEN__)
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
+#include <thread>
+#include <emscripten/emscripten.h>
+#endif
 
 #if REX_PLATFORM_PS5
 // [ps5 port] clock_gettime is a system call on the PS5; the guest reads the
@@ -62,19 +69,66 @@ uint64_t Clock::host_tick_count_platform() {
 #if REX_PLATFORM_PS5
   if (Ps5TscFrequency()) return sceKernelReadTsc();
 #endif
-  timespec tp;
 #if defined(__EMSCRIPTEN__)
-  // [web port] Emscripten has no CLOCK_MONOTONIC_RAW: the call fails and
-  // leaves tp unset, so the guest clock jumped about (game time ran ~2.5x).
-  int error = clock_gettime(CLOCK_MONOTONIC, &tp);
+  // [web port] Each read is a call out to JavaScript (performance.now), and
+  // the game reads the clock (mftb, KeQueryPerformanceCounter) hundreds of
+  // thousands of times a second: a tenth of its main thread went to it. So a
+  // thread reading it in a tight loop - 128 times or more in the last
+  // millisecond (WebClockEpoch, bumped by a ticker thread) - gets its last
+  // reading plus a nanosecond, up to 15 times, then the real time again: a
+  // few microseconds behind at most, and always going forward. Other threads
+  // always read the real time: one reading it now and then would otherwise
+  // get a reading up to a millisecond old, and the game's frame pacing,
+  // waiting on such readings, made every frame a millisecond long (55 frames
+  // a second, not 60). Before the ticker runs (StartWebClockTicker, at
+  // startup) every read is a real one, and always with REX_WEB_EXACT_CLOCK
+  // set (?env=REX_WEB_EXACT_CLOCK=1).
+  thread_local uint64_t last = 0;
+  thread_local uint32_t reads = 0, epoch = 0, in_epoch = 0;
+  thread_local bool hot = false;
+  const uint32_t now_epoch = WebClockEpoch().load(std::memory_order_relaxed);
+  if (now_epoch != epoch) {
+    hot = in_epoch >= 128;
+    in_epoch = 0;
+    epoch = now_epoch;
+    reads = 16;  // (a real read first)
+  }
+  in_epoch++;
+  if (now_epoch && hot && ++reads < 16) return ++last;
+  reads = 0;
+  const uint64_t ns = uint64_t(emscripten_get_now() * 1e6);
+  last = ns > last ? ns : last + 1;
+  return last;
 #else
+  timespec tp;
   int error = clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
-#endif
   assert_zero(error);
 
   return tp.tv_nsec + tp.tv_sec * 1000000000ull;
 #endif
+#endif
 }
+
+#if defined(__EMSCRIPTEN__)
+std::atomic<uint32_t>& WebClockEpoch() {
+  static std::atomic<uint32_t> epoch{0};
+  return epoch;
+}
+
+void StartWebClockTicker() {
+  if (std::getenv("REX_WEB_EXACT_CLOCK")) return;
+  static std::once_flag started;
+  std::call_once(started, [] {
+    std::thread([] {
+      for (;;) {
+        const timespec millisecond{0, 1000000};
+        nanosleep(&millisecond, nullptr);
+        WebClockEpoch().fetch_add(1, std::memory_order_relaxed);
+      }
+    }).detach();
+  });
+}
+#endif
 
 uint64_t Clock::QueryHostSystemTime() {
   // https://docs.microsoft.com/en-us/windows/win32/sysinfo/converting-a-time-t-value-to-a-file-time

@@ -83,15 +83,9 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
     return 1;
   }
 
-  av_context_ = avcodec_alloc_context3(av_codec_);
-  if (!av_context_) {
-    REXAPU_ERROR("XmaContext {}: Couldn't allocate context", id);
-    return 1;
-  }
-
-  // Initialize these to 0. They'll actually be set later.
-  av_context_->channels = 0;
-  av_context_->sample_rate = 0;
+  // (no codec context yet: PrepareDecoder makes one when a voice first plays
+  // on this context, as it would anyway for each new stream. One for each of
+  // the 320 contexts up front held 140 MB, most of them never used.)
 
   av_frame_ = av_frame_alloc();
   if (!av_frame_) {
@@ -257,6 +251,8 @@ void XmaContext::Release() {
   handoff::Record("xma-release", id_, {handoff_generation_, handoff_codec_epoch_, handoff_frame_, uint64_t(reinterpret_cast<uintptr_t>(av_context_)), uint64_t(av_context_?av_context_->frame_number:0), current_frame_remaining_subframes_}, "codec-reset-pending");
   set_is_enabled(false);
   ResetDecoderStreamLocked();
+  // (the next voice gets a fresh codec anyway: this one's memory goes now)
+  if (av_context_) avcodec_free_context(&av_context_);
   set_is_allocated(false);
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));

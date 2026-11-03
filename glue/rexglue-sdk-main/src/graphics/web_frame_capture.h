@@ -177,6 +177,11 @@ struct WebFrame {
   uint32_t consumed;     // the sequence the page has finished reading (it writes this)
   uint32_t reading;      // the sequence whose header the page has read and is drawing (it writes this)
   uint32_t pad;
+  // The bytes the draws point into (constants, their own vertices and
+  // indices), one block: the page uploads it whole, each draw at its offset.
+  uint64_t draw_bytes;
+  uint32_t draw_bytes_size;
+  uint32_t pad2;
 };
 
 void SetMemory(memory::Memory* memory);

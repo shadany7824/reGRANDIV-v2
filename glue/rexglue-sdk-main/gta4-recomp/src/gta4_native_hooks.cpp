@@ -4493,10 +4493,10 @@ extern "C" void sub_82A42168(PPCContext& ctx, uint8_t* base) {
       transform_after[14], transform_after[15]);
 }
 
-void LogKnownOffscreenTransformBoundary(std::string_view point, const PPCContext& ctx,
-                                        uint8_t* base, uint32_t object,
-                                        uint32_t explicit_device = 0) {
-  if (!IsNativeMode() || !HookDiagnosticsEnabled(rex::diagnostics::Category::kNativeTrace)) {
+[[gnu::noinline]] void LogKnownOffscreenTransformBoundarySlow(std::string_view point, const PPCContext& ctx,
+                                                             uint8_t* base, uint32_t object,
+                                                             uint32_t explicit_device) {
+  if (!IsNativeMode()) {
     return;
   }
   const uint32_t device = explicit_device ? explicit_device : LoadU32(base, kDeferredDeviceGlobal);
@@ -4529,6 +4529,14 @@ void LogKnownOffscreenTransformBoundary(std::string_view point, const PPCContext
       transform[1], transform[2], transform[3], transform[4], transform[5], transform[6],
       transform[7], transform[8], transform[9], transform[10], transform[11], transform[12],
       transform[13], transform[14], transform[15]);
+}
+// (the diagnostics' switch inline at each call: it's one load, and these run
+// for every material draw - several calls a draw on the render thread)
+[[gnu::always_inline]] inline void LogKnownOffscreenTransformBoundary(std::string_view point, const PPCContext& ctx,
+                                                                     uint8_t* base, uint32_t object,
+                                                                     uint32_t explicit_device = 0) {
+  if (HookDiagnosticsEnabled(rex::diagnostics::Category::kNativeTrace)) [[unlikely]]
+    LogKnownOffscreenTransformBoundarySlow(point, ctx, base, object, explicit_device);
 }
 
 void LogKnownOffscreenTransformTransition(std::string_view point, uint8_t* base, uint32_t device,
@@ -8024,6 +8032,41 @@ static void Ps5LimitFrameRate() {
 }
 #endif
 
+#if REX_PLATFORM_WEB
+REXCVAR_DECLARE(uint32_t, gta4_frame_limit);
+// [web port] The hub's Frame Limit below 60 (the vblank already holds the game
+// to 60): the game waits after each present until its frame's time is up, so
+// a weak computer, a phone or a Chromebook does half the work at 30 and keeps
+// an even pace, as the Xbox 360 aimed for.
+static void WebLimitFrameRate() {
+  static int64_t next_ns = 0;
+  const uint32_t fps = REXCVAR_GET(gta4_frame_limit);
+  if (!fps || fps >= 60) {
+    next_ns = 0;
+    return;
+  }
+  const auto clock = [] {
+    return int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count());
+  };
+  // (the TV's rate, 59.94 Hz: 30 is 29.97, so it doesn't drift against the vblanks)
+  const int64_t period = 1001000000ll / fps;
+  int64_t now = clock();
+  // (late by a whole frame, or the clock far off: start the count again)
+  if (!next_ns || now - next_ns >= period || next_ns - now > 2 * period) {
+    next_ns = now + period;
+    return;
+  }
+  while (now < next_ns) {
+    const int64_t left = next_ns - now;
+    const timespec delay{0, long(left > 1000000 ? left - 500000 : left)};
+    nanosleep(&delay, nullptr);
+    now = clock();
+  }
+  next_ns += period;
+}
+#endif
+
 extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
   if (!IsNativeMode()) {
     __imp__sub_82A467D8(ctx, base);
@@ -8119,6 +8162,8 @@ extern "C" void sub_82A467D8(PPCContext& ctx, uint8_t* base) {
   SubmitNativeCommand(command);
 #if REX_PLATFORM_PS5
   Ps5LimitFrameRate();
+#elif REX_PLATFORM_WEB
+  WebLimitFrameRate();
 #endif
   ctx.r3.u32 = device;
 }

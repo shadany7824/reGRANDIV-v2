@@ -15,6 +15,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <rex/logging.h>
@@ -476,6 +477,19 @@ class HubDialog final : public rex::ui::ImGuiDialog {
       done_ = true;
       Close();
       launch_();
+#if defined(__EMSCRIPTEN__)
+      // [web port] The hub's big pictures (Home's art, the logos) once the
+      // game has drawn a while: the hub isn't shown again, and they are ~70 MB
+      // in the browser's memory. The buttons' small pictures stay (dialogs in
+      // the game draw them).
+      std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(15));
+        auto& textures = *g_textures;
+        textures.erase(std::remove_if(textures.begin(), textures.end(),
+                                      [](const auto& t) { return t && uint64_t(t->width) * t->height >= 256 * 256; }),
+                       textures.end());
+      }).detach();
+#endif
     }
   }
 

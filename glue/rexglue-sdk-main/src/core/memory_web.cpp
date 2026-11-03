@@ -86,6 +86,31 @@ void* AllocateBlock(size_t length) {
 
 }  // namespace
 
+// Zeroes a range the way decommitting it would, writing only the pages that
+// aren't zero already: a write commits a page for good (linear memory never
+// shrinks), and the guest decommits ranges it never touched, which a plain
+// memset made cost real memory.
+void ZeroRange(void* base, size_t length) {
+  auto* bytes = static_cast<uint8_t*>(base);
+  size_t at = 0;
+  while (at < length) {
+    const size_t page_end = std::min(length, ((reinterpret_cast<uintptr_t>(bytes + at) | (kWebPageSize - 1)) + 1) -
+                                                 reinterpret_cast<uintptr_t>(bytes));
+    const uint8_t* p = bytes + at;
+    const size_t n = page_end - at;
+    bool zero = true;
+    size_t i = 0;
+    for (; zero && i + 8 <= n; i += 8) {
+      uint64_t w;
+      std::memcpy(&w, p + i, 8);
+      zero = w == 0;
+    }
+    for (; zero && i < n; i++) zero = p[i] == 0;
+    if (!zero) std::memset(bytes + at, 0, n);
+    at = page_end;
+  }
+}
+
 size_t page_size() {
   return kWebPageSize;
 }
@@ -124,12 +149,12 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
     return false;
   }
   if (deallocation_type == DeallocationType::kDecommit) {
-    std::memset(base_address, 0, length);
+    ZeroRange(base_address, length);
     return true;
   }
   if (start != address || !block->owned) {
     // Releasing part of a block (or of a mapping's backing): just clear it.
-    std::memset(base_address, 0, length);
+    ZeroRange(base_address, length);
     return true;
   }
   blocks.erase(start);

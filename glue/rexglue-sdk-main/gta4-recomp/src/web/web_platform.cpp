@@ -104,3 +104,22 @@ rex::system::xam::LiveBackendServices CreateCommunityMultiplayerBackend(
 // The FSR 1 presenter that owns this setting is not built without a renderer.
 REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction, 0.2, "Display",
                       "FSR 1 sharpness reduction (unused on the web until a presenter exists)");
+
+// The recompiled code's multiply-adds (PPC fmadd and kin: std::fma, some
+// fifteen thousand sites). WebAssembly has no fused multiply-add, so the C
+// library's fma is a software routine exact to the last bit - tens of
+// nanoseconds a call, and the game makes millions a second: a third of the
+// audio thread and a sizeable part of the others on a slow CPU. These take
+// the place of the library's (the linker uses an object's definition before
+// an archive's): a multiply and an add, unfused. For the single-precision
+// instructions most of the game uses, inputs are floats whose product a
+// double holds exactly, so the result rounds as the fused one would; the
+// vector multiply-adds (simde) were already unfused here.
+#pragma clang fp contract(off)
+extern "C" double fma(double a, double b, double c) {
+  return a * b + c;
+}
+extern "C" float fmaf(float a, float b, float c) {
+  return float(double(a) * double(b) + double(c));
+}
+#pragma clang fp contract(on)

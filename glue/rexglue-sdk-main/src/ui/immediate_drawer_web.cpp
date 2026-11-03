@@ -2,8 +2,9 @@
  * @file        ui/immediate_drawer_web.cpp
  * @brief       [web port] Immediate drawer for the browser page
  *
- * See immediate_drawer_web.h. Textures keep their pixels for the page (it
- * uploads each once, by id); a frame's vertices, indices and draws are built
+ * See immediate_drawer_web.h. Textures keep their pixels until the page has
+ * uploaded them (it uploads each once, by id, and says so:
+ * rex_web_ui_texture_uploaded); a frame's vertices, indices and draws are built
  * between Begin and End and published as one of two buffers, so the page
  * reads a whole frame while the next is recorded.
  *
@@ -34,6 +35,12 @@ struct TextureData {
 std::map<uint32_t, TextureData> g_textures;
 std::vector<WebUiTexture> g_texture_table[2];
 uint32_t g_next_texture_id = 1;
+// Ids the page has uploaded (webui.js), their pixels let go at the next End:
+// the hub's pictures and ImGui's font atlas are 130 MB of copies otherwise.
+constexpr uint32_t kUploadRing = 1024;
+std::atomic<uint32_t> g_uploaded[kUploadRing];
+std::atomic<uint32_t> g_uploaded_head{0};
+uint32_t g_uploaded_tail = 0;
 
 struct FrameData {
   std::vector<ImmediateVertex> vertices;
@@ -127,6 +134,13 @@ void WebImmediateDrawer::End() {
     std::lock_guard lock(g_mutex);
     const int index = g_published_index ^ 1;
     std::swap(g_published[index], g_building);
+    for (; g_uploaded_tail != g_uploaded_head.load(std::memory_order_acquire); g_uploaded_tail++) {
+      const uint32_t id = g_uploaded[g_uploaded_tail % kUploadRing].exchange(0, std::memory_order_acq_rel);
+      if (auto it = g_textures.find(id); it != g_textures.end()) {
+        std::vector<uint8_t>().swap(it->second.pixels);
+        it->second.info.pixels = 0;
+      }
+    }
     auto& table = g_texture_table[index];
     table.clear();
     for (const auto& [id, t] : g_textures) table.push_back(t.info);
@@ -148,6 +162,14 @@ void WebImmediateDrawer::End() {
 }
 
 }  // namespace rex::ui
+
+// The page has a texture on the GPU: its pixels can go (at the next End).
+extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_ui_texture_uploaded(uint32_t id) {
+  using namespace rex::ui;
+  const uint32_t at = g_uploaded_head.load(std::memory_order_relaxed);
+  g_uploaded[at % kUploadRing].store(id, std::memory_order_relaxed);
+  g_uploaded_head.store(at + 1, std::memory_order_release);
+}
 
 // The page's view of the latest overlay frame.
 extern "C" EMSCRIPTEN_KEEPALIVE const rex::ui::WebUiFrame* rex_web_ui_frame() {

@@ -26,6 +26,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <malloc.h>
+#include <unistd.h>
 #include <emscripten/emscripten.h>
 #include <xxhash.h>
 
@@ -79,6 +81,10 @@ struct TextureSlot {
   uint32_t levels = 1;      // mips in pixels, one after another
 };
 std::unordered_map<uint64_t, uint32_t> g_texture_lookup;  // key ^ swizzle -> slot
+// Bumped whenever what a stage's texture resolves to can change other than
+// by its own fetch words or a new frame: a slot taken for another texture,
+// a resolve or depth handoff, the cache dropped (TextureFor3D's cache).
+uint32_t g_texture_generation = 1;
 // Small textures are rewritten by the game (the 32x32 fade texture holds the
 // fade's opacity), so each frame that uses them hashes all their bytes and
 // decodes them again when those changed (16 KiB at most: cheaper than the
@@ -90,6 +96,23 @@ WebTexture g_textures[kMaxTextures];
 uint32_t g_texture_count = 0;
 uint32_t g_next_reuse = 0;
 uint32_t g_texture_serial = 0;
+// The serial of each slot's pixels the page has on the GPU (it writes them,
+// index.html syncTexture). The page keeps a slot's texture until the slot
+// changes, so once it has the latest pixels they are let go here
+// (FreeUploadedPixels): a slot's pixels are only needed until the upload.
+uint32_t g_texture_acks[kMaxTextures];
+
+void FreeUploadedPixels() {
+  for (uint32_t i = 0; i < g_texture_count; i++) {
+    TextureSlot& entry = g_texture_slots[i];
+    if (!entry.pixels.capacity() ||
+        std::atomic_ref<uint32_t>(g_texture_acks[i]).load(std::memory_order_acquire) != g_textures[i].serial) {
+      continue;
+    }
+    std::vector<uint8_t>().swap(entry.pixels);
+    g_textures[i].pixels = 0;
+  }
+}
 
 // This frame's quads, and the two published lists (the page reads one while
 // the next frame fills the other).
@@ -584,9 +607,27 @@ bool CopyBlocks(const TextureInfo& info, std::vector<uint8_t>& blocks) {
   return true;
 }
 
-// A hash of three 256-byte samples (start, middle, end) of guest bytes and
-// the size: new contents in recycled memory change them (once a frame for
-// every buffer and texture drawn, so kept small).
+// A hash of a few hundred bytes, inline: XXH3's setup cost more than its
+// hashing for samples this small (a twentieth of the render thread on a slow
+// CPU). Only for telling changed contents from the same.
+inline uint64_t SampleHash(const uint8_t* bytes, uint32_t size) {
+  uint64_t h = 0x9E3779B97F4A7C15ull ^ size;
+  uint32_t i = 0;
+  for (; i + 8 <= size; i += 8) {
+    uint64_t w;
+    std::memcpy(&w, bytes + i, 8);
+    h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+    h ^= h >> 29;
+  }
+  for (; i < size; i++) h = (h ^ bytes[i]) * 0x100000001B3ull;
+  return h ^ (h >> 32);
+}
+
+// A hash of three samples (start, middle, end) of guest bytes and the size:
+// new contents in recycled memory change them (once a frame for every buffer
+// and texture drawn, so kept small: 64 bytes each for buffers, which the game
+// rewrites whole - thousands a frame in a busy street, and hashing 256 each
+// was a tenth of the game's render thread - and 256 for textures).
 // (`virtual_address`: a buffer's, which the game gives as a virtual address,
 // as the native renderer reads it; textures' are physical)
 uint64_t ContentSample(uint32_t address, uint32_t size, bool virtual_address = false) {
@@ -598,11 +639,11 @@ uint64_t ContentSample(uint32_t address, uint32_t size, bool virtual_address = f
   const uint8_t* bytes = virtual_address ? g_memory->TranslateVirtual<const uint8_t*>(address)
                                          : g_memory->TranslatePhysical<const uint8_t*>(address);
   if (!bytes) return 0;
-  const uint32_t chunk = std::min<uint32_t>(size, 256);
-  uint64_t hash = XXH3_64bits(bytes, chunk) ^ size;
+  const uint32_t chunk = std::min<uint32_t>(size, virtual_address ? 64 : 256);
+  uint64_t hash = SampleHash(bytes, chunk) ^ size;
   if (size > 3 * chunk) {
-    hash ^= XXH3_64bits(bytes + (size / 2 & ~3u), chunk) * 31;
-    hash ^= XXH3_64bits(bytes + size - chunk, chunk) * 131;
+    hash ^= SampleHash(bytes + (size / 2 & ~3u), chunk) * 31;
+    hash ^= SampleHash(bytes + size - chunk, chunk) * 131;
   }
   return hash;
 }
@@ -863,6 +904,7 @@ uint32_t TextureFor(uint32_t device, uint32_t stage = 0, bool targets = true) {
   }
   TextureSlot& entry = g_texture_slots[slot];
   entry.used_frame = g_frame_number;
+  g_texture_generation++;
   if (entry.key) {
     g_texture_lookup.erase(entry.key ^ (uint64_t(entry.swizzle) * 0x9E3779B97F4A7C15ull));
   }
@@ -931,6 +973,7 @@ constexpr uint32_t kBoundTexturesOffset = 0x30F8;
 std::unordered_map<uint32_t, uint32_t> g_resolve_ids;
 
 uint32_t ResolveId(uint32_t texture) {
+  g_texture_generation++;
   return g_resolve_ids.try_emplace(texture, uint32_t(g_resolve_ids.size() + 1)).first->second;
 }
 
@@ -967,10 +1010,37 @@ void LogTargetMapping(const char* via, uint32_t stage, uint32_t handle, const xe
               uint32_t(fetch.format), id);
 }
 
+uint32_t TextureFor3DUncached(uint32_t device, uint32_t stage, uint32_t handle,
+                              const xenos::xe_gpu_texture_fetch_t& fetch);
+// The last answer for each stage: draws mostly sample what the draw before
+// them did, and finding it again (three maps, a texture lookup) for every
+// stage of every draw was a real part of the render thread on a slow CPU.
+// Good for the same handle and fetch words, in the same frame, while
+// g_texture_generation stays.
+struct StageTexture {
+  uint32_t generation = 0, frame = 0, handle = 0, result = 0;
+  uint32_t words[6] = {};
+};
+StageTexture g_stage_textures[kWebDrawTextures];
 uint32_t TextureFor3D(uint32_t device, uint32_t stage) {
   const uint8_t* bound = g_memory->TranslateVirtual<const uint8_t*>(device + kBoundTexturesOffset);
   const uint32_t handle = LoadBE32(bound + stage * 4);
   const auto fetch = ReadFetch(device, stage);
+  const uint32_t words[6] = {fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5};
+  StageTexture& last = g_stage_textures[stage % kWebDrawTextures];
+  if (last.generation == g_texture_generation && last.frame == g_frame_number && last.handle == handle &&
+      !std::memcmp(last.words, words, sizeof(words))) {
+    return last.result;
+  }
+  const uint32_t result = TextureFor3DUncached(device, stage, handle, fetch);
+  // (the generation as it is now: looking the texture up may itself have
+  // taken a slot)
+  last = {g_texture_generation, g_frame_number, handle, result};
+  std::memcpy(last.words, words, sizeof(words));
+  return result;
+}
+uint32_t TextureFor3DUncached(uint32_t device, uint32_t stage, uint32_t handle,
+                              const xenos::xe_gpu_texture_fetch_t& fetch) {
   const auto found = g_resolve_ids.find(handle);
   if (found != g_resolve_ids.end()) {
     LogTargetMapping("handle", stage, handle, fetch, found->second);
@@ -1022,7 +1092,7 @@ constexpr uint32_t kPixelBooleansOffset = 0x2790;
 constexpr uint32_t kDrawConstantsSize = 2 * kConstantsSize + sizeof(native::core::SharedConstants);
 constexpr size_t kMaxDraws = 16384;
 
-std::unordered_map<uint32_t, uint64_t> g_shader_hashes;  // shader object -> cache hash
+std::unordered_map<uint32_t, uint64_t> g_shader_hashes;  // shader object -> cache hash (ShaderInfoFor)
 // Texture stages each shader samples, by cache hash, as the page reports them
 // from the shaders' WGSL (rex_web_shader_stages); unknown shaders: all.
 std::unordered_map<uint64_t, uint32_t> g_shader_stage_masks;
@@ -1044,6 +1114,30 @@ ConstantNeed NeedOf(uint64_t hash) {
   const auto found = g_shader_constant_needs.find(hash);
   return found != g_shader_constant_needs.end() ? found->second : ConstantNeed{};
 }
+// A shader object's hash, constant needs and stages, as the last draw that
+// bound it found them: draws mostly repeat their shaders, and the four map
+// lookups a draw made were a real part of the render thread on a slow CPU.
+// (`g_shader_info_generation`: bumped when any of those maps change)
+uint32_t g_shader_info_generation = 1;
+struct ShaderInfo {
+  uint32_t object = 0, generation = 0;
+  bool known = false;
+  uint64_t hash = 0;
+  ConstantNeed need;
+  uint32_t stages = ~0u;
+};
+const ShaderInfo& ShaderInfoFor(uint32_t object, ShaderInfo& last) {
+  if (last.generation == g_shader_info_generation && last.object == object) return last;
+  last.object = object;
+  last.generation = g_shader_info_generation;
+  const auto found = g_shader_hashes.find(object);
+  last.known = found != g_shader_hashes.end();
+  last.hash = last.known ? found->second : 0;
+  last.need = last.known ? NeedOf(last.hash) : ConstantNeed{0, 0};
+  last.stages = last.known ? StageMask(last.hash) : 0;
+  return last;
+}
+ShaderInfo g_last_vs_info, g_last_ps_info;
 uint32_t g_vertex_shader = 0, g_pixel_shader = 0, g_declaration = 0, g_index_buffer = 0;
 struct StreamState {
   uint32_t buffer = 0, offset = 0, stride = 0;
@@ -1124,9 +1218,15 @@ struct ConvertedBuffer {
   // geometry into recycled buffers without an unlock this capture sees.
   uint32_t checked_frame = 0;
   uint64_t content = 0;
+  uint64_t first_content = 0;  // (the first sample's alone: BufferUnchanged)
   std::vector<uint8_t> bytes;
+  bool holding = false;  // (in g_holding_buffers)
 };
 std::unordered_map<uint64_t, ConvertedBuffer> g_buffers;
+// The converted buffers holding bytes, which FreeUploadedBuffers looks at
+// (the map's entries stay where they are until it is cleared): walking all
+// of g_buffers, 17,000 in a street, was 0.8 ms of every frame.
+std::vector<ConvertedBuffer*> g_holding_buffers;
 // How often each buffer was unlocked for writing: a capture older than its
 // buffer's latest unlock is converted again.
 std::unordered_map<uint32_t, uint32_t> g_unlocks;
@@ -1141,6 +1241,32 @@ struct ConvertCounts {
 };
 ConvertCounts g_converts;
 constexpr size_t kMaxBufferBytes = 768u << 20;
+
+// The page's GPU copies of converted buffers (scene3d.js gpuBuffer writes
+// them): slot id % kBufferAckSlots holds id << 32 | serial, 0 serial once the
+// page has let its copy go. A buffer the page has at its latest serial needs
+// no bytes here (FreeUploadedBuffers): they are converted again when this
+// capture reads them itself or the page has dropped its copy (Capture). That
+// is most of the converted buffers' 170-200 MB.
+constexpr uint32_t kBufferAckSlots = 1u << 16;
+uint64_t g_buffer_acks[kBufferAckSlots];
+bool PageHas(const ConvertedBuffer& b) {
+  return std::atomic_ref<uint64_t>(g_buffer_acks[b.id % kBufferAckSlots]).load(std::memory_order_acquire) ==
+         (uint64_t(b.id) << 32 | b.serial);
+}
+void FreeUploadedBuffers() {
+  size_t kept = 0;
+  for (ConvertedBuffer* b : g_holding_buffers) {
+    if (!b->bytes.empty() && !PageHas(*b)) {
+      g_holding_buffers[kept++] = b;
+      continue;
+    }
+    g_buffer_bytes -= std::min(g_buffer_bytes, b->bytes.size());
+    std::vector<uint8_t>().swap(b->bytes);
+    b->holding = false;
+  }
+  g_holding_buffers.resize(kept);
+}
 
 // This frame's draws and the bytes they point into (constants, generated
 // indices), as offsets until the frame is published.
@@ -1163,6 +1289,21 @@ ConstantBlock g_last_shared_constants;
 // stored (`pieces`, ConstantNeed's bits); the other pieces of the stored
 // block are left as they are (no draw using it reads them).
 constexpr uint32_t kConstantPiece = 256;
+// Whether two blocks hold the same bytes, 8 at a time (the C library's
+// memcmp goes a byte at a time here: comparing each draw's constants with
+// it was a sixth of the render thread on a slow CPU).
+inline bool SameBytes(const uint8_t* a, const uint8_t* b, size_t size) {
+  size_t i = 0;
+  for (; i + 8 <= size; i += 8) {
+    uint64_t x, y;
+    std::memcpy(&x, a + i, 8);
+    std::memcpy(&y, b + i, 8);
+    if (x != y) return false;
+  }
+  for (; i < size; i++)
+    if (a[i] != b[i]) return false;
+  return true;
+}
 struct ConstantBank {
   std::array<uint8_t, 4096> raw{};
   uint32_t pieces = 0;
@@ -1194,10 +1335,75 @@ const VertexInputs& FloatInputs() {
   return inputs;
 }
 
+// A buffer's bytes converted from the guest's (its address, size and flags
+// set): index words swapped, vertices as the declaration's stream says.
+bool ConvertBytes(ConvertedBuffer& entry, uint32_t declaration, uint32_t stream, uint32_t offset, uint32_t stride) {
+  const bool index = (entry.flags & 0xF) == 2;
+  const int64_t convert_start = NowNs();
+  struct ConvertTime {
+    int64_t start;
+    size_t size;
+    ~ConvertTime() {
+      g_frame_work.converts++;
+      g_frame_work.convert_ns += NowNs() - start;
+      g_frame_work.convert_bytes += size;
+    }
+  } convert_time{convert_start, entry.size};
+  // (a virtual address, as the native renderer reads it: GTA IV keeps some
+  // geometry - the sky dome - in ordinary virtual memory, which the
+  // physical window does not alias)
+  const uint8_t* source = g_memory->TranslateVirtual<const uint8_t*>(entry.address);
+  if (!source) return false;
+  entry.bytes.resize(entry.size);
+  if (!entry.holding) {
+    entry.holding = true;
+    g_holding_buffers.push_back(&entry);
+  }
+  if (index) {
+    if (entry.flags & 0x80000000u) {
+      for (size_t i = 0; i + 4 <= entry.size; i += 4) {
+        const uint32_t value = LoadBE32(source + i) & xenos::kVertexIndexMask;
+        std::memcpy(entry.bytes.data() + i, &value, 4);
+      }
+    } else {
+      for (size_t i = 0; i + 2 <= entry.size; i += 2) {
+        entry.bytes[i] = source[i + 1];
+        entry.bytes[i + 1] = source[i];
+      }
+    }
+  } else {
+    native::core::ConvertGuestVertexPayload(entry.bytes.data(), source, entry.size,
+                                            g_decl_views[declaration], FloatInputs(), stream, offset,
+                                            stride);
+  }
+  g_buffer_bytes += entry.size;
+  return true;
+}
+
+// A buffer's first 64 bytes' hash (virtual address), 0 outside memory.
+uint64_t FirstSample(uint32_t address, uint32_t size) {
+  if (!size || uint64_t(address) + size > uint64_t(UINT32_MAX) + 1) return 0;
+  const uint8_t* bytes = g_memory->TranslateVirtual<const uint8_t*>(address);
+  return bytes ? SampleHash(bytes, std::min<uint32_t>(size, 64)) : 0;
+}
+// Whether a cached buffer's guest bytes look the same: its first sample every
+// frame (new contents in recycled memory - a new mesh - change it), all three
+// every fourth frame, staggered by buffer (reading the three samples of each
+// of thousands of buffers every frame was a sixteenth of the render thread on
+// a slow CPU, for the guest memory it reads).
+bool BufferUnchanged(const ConvertedBuffer& b) {
+  if ((g_frame_number + b.id) & 3) return FirstSample(b.address, b.size) == b.first_content;
+  return ContentSample(b.address, b.size, true) == b.content;
+}
+
 // A guest vertex or index buffer, converted (cached until it is unlocked for
-// writing or moves). Null when the handle doesn't describe a buffer.
+// writing or moves). Null when the handle doesn't describe a buffer. Its
+// bytes may have gone once the page has them (FreeUploadedBuffers):
+// `need_bytes` when this capture reads them itself (rectangle lists, fans,
+// quads, strips with restarts), which converts them again, as does the page
+// having dropped its copy. (Their serial stays: the contents are the same.)
 ConvertedBuffer* Capture(uint32_t handle, uint32_t declaration, uint32_t stream, uint32_t offset,
-                         uint32_t stride) {
+                         uint32_t stride, bool need_bytes = false) {
   const uint8_t* header = g_memory->TranslateVirtual<const uint8_t*>(handle);
   if (!handle || !header) return nullptr;
   const uint32_t flags = LoadBE32(header);
@@ -1217,14 +1423,19 @@ ConvertedBuffer* Capture(uint32_t handle, uint32_t declaration, uint32_t stream,
     } else if (metadata->guest_locked || cached.unlocks != unlocks) {
       reason = 1;
     } else {
-      if (!g_option_buffers || cached.checked_frame == g_frame_number) return &cached;
+      const auto ready = [&]() -> ConvertedBuffer* {
+        if (!cached.bytes.empty() || (!need_bytes && PageHas(cached))) return &cached;
+        return ConvertBytes(cached, declaration, stream, offset, stride) ? &cached : nullptr;
+      };
+      if (!g_option_buffers || cached.checked_frame == g_frame_number) return ready();
       cached.checked_frame = g_frame_number;
-      if (ContentSample(cached.address, cached.size, true) == cached.content) return &cached;
+      if (BufferUnchanged(cached)) return ready();
       reason = 3;
     }
   }
   if (g_buffer_bytes > kMaxBufferBytes) {
     g_buffers.clear();
+    g_holding_buffers.clear();
     g_buffer_bytes = 0;
     found = g_buffers.end();
     reason = 4;
@@ -1240,47 +1451,24 @@ ConvertedBuffer* Capture(uint32_t handle, uint32_t declaration, uint32_t stream,
   entry.unlocks = g_unlocks[handle];
   entry.checked_frame = g_frame_number;
   entry.content = ContentSample(entry.address, entry.size, true);
+  entry.first_content = FirstSample(entry.address, entry.size);
   entry.serial = ++g_buffer_serial;
-  const int64_t convert_start = NowNs();
-  struct ConvertTime {
-    int64_t start;
-    size_t size;
-    ~ConvertTime() {
-      g_frame_work.converts++;
-      g_frame_work.convert_ns += NowNs() - start;
-      g_frame_work.convert_bytes += size;
-    }
-  } convert_time{convert_start, entry.size};
-  entry.bytes.resize(entry.size);
-  // (a virtual address, as the native renderer reads it: GTA IV keeps some
-  // geometry - the sky dome - in ordinary virtual memory, which the
-  // physical window does not alias)
-  const uint8_t* source = g_memory->TranslateVirtual<const uint8_t*>(entry.address);
-  if (!source) return nullptr;
-  if (index) {
-    if (flags & 0x80000000u) {
-      for (size_t i = 0; i + 4 <= entry.size; i += 4) {
-        const uint32_t value = LoadBE32(source + i) & xenos::kVertexIndexMask;
-        std::memcpy(entry.bytes.data() + i, &value, 4);
-      }
-    } else {
-      for (size_t i = 0; i + 2 <= entry.size; i += 2) {
-        entry.bytes[i] = source[i + 1];
-        entry.bytes[i + 1] = source[i];
-      }
-    }
-  } else {
-    native::core::ConvertGuestVertexPayload(entry.bytes.data(), source, entry.size,
-                                            g_decl_views[declaration], FloatInputs(), stream, offset,
-                                            stride);
-  }
-  g_buffer_bytes += entry.size;
-  return &entry;
+  return ConvertBytes(entry, declaration, stream, offset, stride) ? &entry : nullptr;
 }
 
+// Whether a strip's restart index is the one a WebGPU strip of 16-bit indices
+// restarts at by itself (RecordDraw then draws the indices unchanged).
+bool NativeRestart(uint32_t restart_value) { return restart_value == 0xFFFFu; }
+// Whether a guest index buffer holds 16-bit indices (its header's flags).
+bool IndexBuffer16(uint32_t handle) {
+  const uint8_t* header = g_memory->TranslateVirtual<const uint8_t*>(handle);
+  return handle && header && !(LoadBE32(header) & 0x80000000u);
+}
+
+// (no bytes once the page has the buffer: data 0, the page keeps its copy)
 WebBuffer Describe(const ConvertedBuffer& buffer) {
-  return {reinterpret_cast<uint64_t>(buffer.bytes.data()), buffer.id, buffer.serial,
-          uint32_t(buffer.bytes.size()), 0, 0, 0};
+  return {buffer.bytes.empty() ? 0 : reinterpret_cast<uint64_t>(buffer.bytes.data()), buffer.id, buffer.serial,
+          buffer.size, 0, 0, 0};
 }
 
 // Immediate-mode vertices (DrawPrimitiveUp) for stream 0, when set.
@@ -1293,14 +1481,14 @@ void RecordDraw(uint32_t device_address, uint32_t primitive, uint32_t first, uin
                 const native::LightingContext& lighting, UpVertices up = {}) {
   if (!count || g_draws.size() >= kMaxDraws) return;
   const auto declaration = g_decl_slots.find(g_declaration);
-  const auto vs = g_shader_hashes.find(g_vertex_shader);
-  const auto ps = g_shader_hashes.find(g_pixel_shader);
-  if (declaration == g_decl_slots.end() || vs == g_shader_hashes.end()) {
+  const ShaderInfo& vs = ShaderInfoFor(g_vertex_shader, g_last_vs_info);
+  const ShaderInfo& ps = ShaderInfoFor(g_pixel_shader, g_last_ps_info);
+  if (declaration == g_decl_slots.end() || !vs.known) {
     static int logged = 0;
     if (logged++ < 10) {
       REXLOG_INFO("web draw skipped: declaration {:08X} {} vertex shader {:08X} {}", g_declaration,
                   declaration != g_decl_slots.end() ? "known" : "unknown", g_vertex_shader,
-                  vs != g_shader_hashes.end() ? "known" : "unknown");
+                  vs.known ? "known" : "unknown");
     }
     return;
   }
@@ -1314,8 +1502,8 @@ void RecordDraw(uint32_t device_address, uint32_t primitive, uint32_t first, uin
     draw.blend_controls[i] =
         native::IsNativeBlendControlEnabled(fixed.blend_controls[i]) ? fixed.blend_controls[i] | 0x80000000u : 0;
   }
-  draw.vs_hash = vs->second;
-  draw.ps_hash = ps != g_shader_hashes.end() ? ps->second : 0;
+  draw.vs_hash = vs.hash;
+  draw.ps_hash = ps.hash;
   draw.decl = declaration->second;
   draw.stage = uint32_t(lighting.stage);
   draw.blend_control = draw.blend_controls[0];
@@ -1367,7 +1555,7 @@ void RecordDraw(uint32_t device_address, uint32_t primitive, uint32_t first, uin
   // Only the part the draw's shaders read is compared and stored (the page
   // reads no more of it: scene3d.js constantNeed, the same rule).
   auto block = [](ConstantBlock& last, const uint8_t* guest, size_t size, bool swap) {
-    if (last.valid && last.raw.size() >= size && !std::memcmp(last.raw.data(), guest, size)) return last.offset;
+    if (last.valid && last.raw.size() >= size && SameBytes(last.raw.data(), guest, size)) return last.offset;
     last.raw.assign(guest, guest + size);
     last.offset = AppendDrawBytes(nullptr, size);
     if (swap) {
@@ -1388,7 +1576,7 @@ void RecordDraw(uint32_t device_address, uint32_t primitive, uint32_t first, uin
       bool same = true;
       for (uint32_t p = pieces; p && same; p &= p - 1) {
         const size_t at = size_t(std::countr_zero(p)) * kConstantPiece;
-        same = !std::memcmp(last.raw.data() + at, guest + at, kConstantPiece);
+        same = SameBytes(last.raw.data() + at, guest + at, kConstantPiece);
       }
       if (same) return last.offset;
     }
@@ -1402,14 +1590,14 @@ void RecordDraw(uint32_t device_address, uint32_t primitive, uint32_t first, uin
     last.pieces = pieces;
     return last.offset;
   };
-  const ConstantNeed vs_need = NeedOf(draw.vs_hash);
-  const ConstantNeed ps_need = draw.ps_hash ? NeedOf(draw.ps_hash) : ConstantNeed{0, 0};
+  const ConstantNeed vs_need = vs.need;
+  const ConstantNeed ps_need = draw.ps_hash ? ps.need : ConstantNeed{0, 0};
   draw.constants = kOffsetFlag | bank(g_last_vertex_constants, device + kVertexConstantsOffset,
                                       vs_need.vertex | ps_need.vertex);
   draw.ps_constants = kOffsetFlag | bank(g_last_pixel_constants, device + kPixelConstantsOffset,
                                          vs_need.pixel | ps_need.pixel);
   // The texture stages the shaders sample (also for the samplers' LOD bias).
-  const uint32_t stages = StageMask(draw.vs_hash) | (draw.ps_hash ? StageMask(draw.ps_hash) : 0);
+  const uint32_t stages = vs.stages | (draw.ps_hash ? ps.stages : 0);
   native::core::SharedConstants shared{};
   // Each sampled stage's fetch-constant LOD bias, which the translated shaders
   // add in their SampleBias instructions (native: shared constants 0x2F0).
@@ -1476,7 +1664,7 @@ void RecordDraw(uint32_t device_address, uint32_t primitive, uint32_t first, uin
   }
   for (const auto& element : g_decl_views[draw.decl].elements) {
     if (up.address) break;
-    if (element.stream >= kWebDrawStreams || draw.streams[element.stream].data) continue;
+    if (element.stream >= kWebDrawStreams || draw.streams[element.stream].data || draw.streams[element.stream].id) continue;
     const StreamState& state = g_streams[element.stream];
     if (ConvertedBuffer* buffer = Capture(state.buffer, draw.decl, element.stream, state.offset, state.stride)) {
       draw.streams[element.stream] = Describe(*buffer);
@@ -1497,10 +1685,18 @@ void RecordDraw(uint32_t device_address, uint32_t primitive, uint32_t first, uin
   }
   const ConvertedBuffer* index_buffer = nullptr;
   if (indexed) {
-    index_buffer = Capture(g_index_buffer, 0, 0, 0, 0);
+    // (the indices read here: those primitives become generated lists below)
+    const bool reads = (primitive == 8 && !up.address) || primitive == 5 || primitive == 13 ||
+                       (restart && (primitive == 3 || primitive == 6 || primitive == 8) &&
+                        !(NativeRestart(restart_value) && IndexBuffer16(g_index_buffer)));
+    index_buffer = Capture(g_index_buffer, 0, 0, 0, 0, reads);
     if (!index_buffer) return;
   }
   const bool index32 = index_buffer && (index_buffer->flags & 0x80000000u);
+  // (a 16-bit strip restarting at 0xFFFF draws its indices as they are: a
+  // WebGPU strip restarts there itself - only other restart values, and 32-bit
+  // indices, whose conversion masks them to 24 bits, need a generated list)
+  const bool native_restart = NativeRestart(restart_value) && (!index_buffer || IndexBuffer16(g_index_buffer));
   auto read = [&](uint32_t i) -> uint32_t {
     if (!indexed) return first + i;
     if (index32) {
@@ -1512,7 +1708,7 @@ void RecordDraw(uint32_t device_address, uint32_t primitive, uint32_t first, uin
     std::memcpy(&value, index_buffer->bytes.data() + size_t(first + i) * 2, 2);
     return value;
   };
-  if (indexed && size_t(first + count) * (index32 ? 4 : 2) > index_buffer->bytes.size()) return;
+  if (indexed && size_t(first + count) * (index32 ? 4 : 2) > index_buffer->size) return;
   if (primitive == 8 && !up.address) {
     // A rectangle list from vertex buffers, as the user-pointer one above:
     // each stream's three corners copied out with the fourth implied
@@ -1527,7 +1723,7 @@ void RecordDraw(uint32_t device_address, uint32_t primitive, uint32_t first, uin
       if (s >= kWebDrawStreams || streams_done[s]) continue;
       streams_done[s] = true;
       const StreamState& state = g_streams[s];
-      const ConvertedBuffer* buffer = Capture(state.buffer, draw.decl, s, state.offset, state.stride);
+      const ConvertedBuffer* buffer = Capture(state.buffer, draw.decl, s, state.offset, state.stride, true);
       if (!buffer || !state.stride) return;
       std::vector<uint8_t> expanded;
       expanded.reserve(size_t(rects) * 6 * state.stride);
@@ -1562,7 +1758,7 @@ void RecordDraw(uint32_t device_address, uint32_t primitive, uint32_t first, uin
     draw.topology = 3;
     draw.count = rects * 6;
     draw.first = 0;
-  } else if (primitive == 5 || primitive == 13 || (strip && restart && indexed)) {
+  } else if (primitive == 5 || primitive == 13 || (strip && restart && indexed && !(native_restart && !index32))) {
     std::vector<uint32_t> generated;
     if (primitive == 5) {
       // (a restart index starts a new fan, as the native VisitNativeTriangleFan)
@@ -1830,6 +2026,7 @@ void OnTitleCommand(uint32_t type, const void* command, size_t command_size) {
       if (!g_targets.count(PhysicalPage(fetch.base_address)) && g_targets.size() >= kMaxTargets) {
         g_targets.erase(g_targets.begin());
       }
+      g_texture_generation++;
       TargetSnapshot& target = g_targets[PhysicalPage(fetch.base_address)];
       target.width = fetch.size_2d.width + 1;
       target.height = fetch.size_2d.height + 1;
@@ -1903,6 +2100,7 @@ void OnTitleCommand(uint32_t type, const void* command, size_t command_size) {
       if (command_size < sizeof(native::RegisterShaderCommand)) return;
       const auto* c = static_cast<const native::RegisterShaderCommand*>(command);
       g_shader_hashes[c->shader] = c->hash;
+      g_shader_info_generation++;
       return;
     }
     case T::kRegisterVertexDeclaration: {
@@ -2035,6 +2233,8 @@ void SwapControlsPicture() {
 void OnPresent(const void* present_command, size_t command_size) {
   std::lock_guard lock(g_mutex);
   SwapControlsPicture();
+  FreeUploadedPixels();
+  FreeUploadedBuffers();
   // Diagnostics: which device presents, with how many 3D events and which
   // front buffer (the first 40 presents after the first 3D frame).
   if (command_size >= sizeof(native::PresentCommand)) {
@@ -2141,10 +2341,14 @@ void OnPresent(const void* present_command, size_t command_size) {
     if (draw.ps_constants & kOffsetFlag) draw.ps_constants = bytes + (draw.ps_constants & ~kOffsetFlag);
     if (draw.shared_constants & kOffsetFlag) draw.shared_constants = bytes + (draw.shared_constants & ~kOffsetFlag);
     if (draw.indices.data & kOffsetFlag) draw.indices.data = bytes + (draw.indices.data & ~kOffsetFlag);
-    if (draw.streams[0].data & kOffsetFlag) draw.streams[0].data = bytes + (draw.streams[0].data & ~kOffsetFlag);
+    // (a rectangle list's expanded vertices can be in any stream)
+    for (auto& stream : draw.streams)
+      if (stream.data & kOffsetFlag) stream.data = bytes + (stream.data & ~kOffsetFlag);
   }
   g_frame.draw_count = uint32_t(g_published_draws[list].size());
   g_frame.draws = reinterpret_cast<uint64_t>(g_published_draws[list].data());
+  g_frame.draw_bytes = bytes;
+  g_frame.draw_bytes_size = uint32_t(g_published_draw_bytes[list].size());
   g_frame.decl_count = uint32_t(g_decls.size());
   g_frame.decls = reinterpret_cast<uint64_t>(g_decls.data());
   g_frame.screen_base = 0;
@@ -2173,6 +2377,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_shader_stages(uint32_t hash_low, ui
   using namespace rex::graphics::web;
   std::lock_guard lock(g_mutex);
   g_shader_stage_masks[uint64_t(hash_high) << 32 | hash_low] = mask;
+  g_shader_info_generation++;
 }
 
 // The bytes of the vertex and pixel constant banks a shader reads (its
@@ -2184,6 +2389,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_shader_constants(uint32_t hash_low,
   std::lock_guard lock(g_mutex);
   g_shader_constant_needs[uint64_t(hash_high) << 32 | hash_low] = {uint16_t(vertex_pieces),
                                                                    uint16_t(pixel_pieces)};
+  g_shader_info_generation++;
 }
 
 // Debug switches: 1 = extra texture formats, 2 = texture byte re-checks,
@@ -2199,6 +2405,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_set_option(int option, int value) {
   if (option == 5) g_option_float_targets = value;
   g_texture_lookup.clear();
   for (auto& slot : g_texture_slots) slot.key = 0;
+  g_texture_generation++;
 }
 
 // Where the player is, for the page's touch controls (touchinput.js): bit 0
@@ -2206,6 +2413,45 @@ extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_set_option(int option, int value) {
 extern "C" EMSCRIPTEN_KEEPALIVE int rex_web_play_state() {
   return rex::graphics::web::g_controls_wanted.load(std::memory_order_relaxed) |
          rex::graphics::web::g_menu_open.load(std::memory_order_relaxed) << 1;
+}
+
+// The page's GPU copies of converted buffers (scene3d.js writes them).
+extern "C" EMSCRIPTEN_KEEPALIVE uint64_t* rex_web_buffer_acks() { return rex::graphics::web::g_buffer_acks; }
+
+// The page's uploaded-serial for each texture slot (index.html writes them).
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t* rex_web_texture_acks() { return rex::graphics::web::g_texture_acks; }
+
+// (the benchmark: bytes the capture holds for textures not yet uploaded, and
+// for converted vertex and index buffers)
+extern "C" EMSCRIPTEN_KEEPALIVE double rex_web_capture_bytes(int which) {
+  using namespace rex::graphics::web;
+  std::lock_guard lock(g_mutex);
+  if (which == 1) return double(g_buffer_bytes);
+  double bytes = 0;
+  for (uint32_t i = 0; i < g_texture_count; i++) bytes += double(g_texture_slots[i].pixels.capacity());
+  return bytes;
+}
+
+// (the benchmark: each guest heap's reserved memory, as a log line)
+extern "C" EMSCRIPTEN_KEEPALIVE void rex_web_log_heaps() {
+  using namespace rex::graphics::web;
+  if (!g_memory) return;
+  std::string line;
+  uint64_t total = 0;
+  for (uint32_t base : {0x00000000u, 0x40000000u, 0x80000000u, 0x90000000u, 0xA0000000u, 0xC0000000u, 0xE0000000u}) {
+    const auto* heap = g_memory->LookupHeap(base);
+    if (!heap) continue;
+    const uint64_t bytes = uint64_t(heap->reserved_page_count()) * heap->page_size();
+    total += bytes;
+    line += fmt::format(" {:08X}={}MB", base, bytes >> 20);
+  }
+  const struct mallinfo m = mallinfo();
+  // (where the guest's memory starts in linear memory: virtual 0 and physical 0)
+  REXLOG_INFO("web heaps: {} MB reserved:{}; malloc {} MB in use, {} MB free in its arena, top of memory at {} MB; "
+              "guest virtual 0 at {} MB, physical 0 at {} MB",
+              total >> 20, line, size_t(m.uordblks) >> 20, size_t(m.fordblks) >> 20,
+              reinterpret_cast<uintptr_t>(sbrk(0)) >> 20, reinterpret_cast<uintptr_t>(g_memory->TranslateVirtual(0)) >> 20,
+              reinterpret_cast<uintptr_t>(g_memory->TranslatePhysical(0)) >> 20);
 }
 
 // The game's presents so far (the page's FPS counter: game frames a second).

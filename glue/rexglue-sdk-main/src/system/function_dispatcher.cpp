@@ -16,6 +16,7 @@
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/perf/counter.h>
 #include <rex/memory.h>
 #include <rex/ppc/context.h>
@@ -23,6 +24,7 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
 
+#include <atomic>
 #include <cstring>
 #include <string>
 
@@ -43,6 +45,25 @@ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
   // The caller's return address and the saved link registers up the guest
   // stack (back chain at 0(r1), each caller's LR 8 bytes below its frame).
   std::string callers;
+#if REX_PLATFORM_WEB
+  // [web port] A call through a null function pointer - a freed object's
+  // table, the title freeing objects on one thread while another still uses
+  // them (web_stale_object_guard.cpp has the sites found so far) - returns
+  // 0 instead of ending the game: the browser build hit it at new sites in
+  // the physics while walking the street (2026-11-03). Up to 256 times; then
+  // it is fatal as before, something being badly wrong.
+  static std::atomic<uint32_t> null_calls{0};
+  if (ctx.last_indirect_target == 0) {
+    const uint32_t n = null_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 256) {
+      if (n <= 8 || !(n % 64))
+        REXLOG_WARN("web: call through a null function pointer #{} (from {:08X}, r3={:08X}); returning 0", n,
+                    uint32_t(ctx.lr), ctx.r3.u32);
+      ctx.r3.u64 = 0;
+      return;
+    }
+  }
+#endif
   uint32_t frame = ctx.r1.u32;
   for (int depth = 0; base && depth < 10 && frame >= 0x70000000u && frame < 0x80000000u; depth++) {
     uint32_t back;

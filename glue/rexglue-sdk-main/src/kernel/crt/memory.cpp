@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include <rex/hook.h>
+#include <rex/memory/utils.h>
 
 namespace rex::kernel::crt {
 
@@ -25,8 +26,27 @@ static void* native_memmove(void* dst, const void* src, size_t n) {
   return std::memmove(dst, src, n);
 }
 
-static void* native_memset(void* dst, int val, size_t n) {
+#ifdef __EMSCRIPTEN__
+// [web port] Large clears write only the pages that aren't zero already
+// (rex::memory::ZeroRange): the title clears whole pools it may never use,
+// and a written page of linear memory is committed for good. Where reading
+// an untouched page maps the shared zero page (Linux: ChromeOS, Android)
+// those pools then cost nothing; elsewhere it is the same as a memset.
+static void* Clear(void* dst, int val, size_t n) {
+  if (val == 0 && n >= (64u << 10)) {
+    rex::memory::ZeroRange(dst, n);
+    return dst;
+  }
   return std::memset(dst, val, n);
+}
+#else
+static void* Clear(void* dst, int val, size_t n) {
+  return std::memset(dst, val, n);
+}
+#endif
+
+static void* native_memset(void* dst, int val, size_t n) {
+  return Clear(dst, val, n);
 }
 
 static void* native_memchr(const void* ptr, int val, size_t n) {
@@ -42,15 +62,15 @@ static void* native_XMemCpy(void* dst, const void* src, size_t n) {
 }
 
 static void* native_XMemSet(void* dst, int val, size_t n) {
-  return std::memset(dst, val, n);
+  return Clear(dst, val, n);
 }
 
 static void* native_XMemSet128(void* dst, int val, size_t n) {
-  return std::memset(dst, val, n);
+  return Clear(dst, val, n);
 }
 
 static void* native_memset_vmx(void* dst, int val, size_t n) {
-  return std::memset(dst, val, n);
+  return Clear(dst, val, n);
 }
 
 // ---------------------------------------------------------------------------

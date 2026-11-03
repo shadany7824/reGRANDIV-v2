@@ -344,7 +344,25 @@ fn dec3n(v: u32) -> vec4<f32> {
   // viewport must lie inside the surface; one reaching outside (a guard band,
   // an atlas tile) is cut to the surface and the shader scales and offsets
   // the position so it lands where the guest's full viewport puts it.
+  // (the last draw's result again when its inputs are the same: most draws
+  // share their viewport, and this ran for every one)
+  const vtLast = new Float64Array(11);
+  let vtLastResult = null, vtLastExp = null;
   function vertexTransform(d, PW, PH) {
+    const v = d.viewport, p = d.params, l = vtLast, exp = window.s3dExp || '';
+    if (vtLastResult && l[0] === v[0] && l[1] === v[1] && l[2] === v[2] && l[3] === v[3] && l[4] === v[4] &&
+        l[5] === v[5] && l[6] === PW && l[7] === PH && l[8] === (p[17] & 2) && l[9] === p[11] &&
+        l[10] === (d.topology >= 3 ? 1 : 0) && vtLastExp === exp && window.s3dBiasMode === undefined) {
+      d.vt = vtLastResult.vt; d.vtKey = vtLastResult.vtKey;
+      return vtLastResult.fit;
+    }
+    const fit = vertexTransformOf(d, PW, PH);
+    l[0] = v[0]; l[1] = v[1]; l[2] = v[2]; l[3] = v[3]; l[4] = v[4]; l[5] = v[5]; l[6] = PW; l[7] = PH;
+    l[8] = p[17] & 2; l[9] = p[11]; l[10] = d.topology >= 3 ? 1 : 0; vtLastExp = exp;
+    vtLastResult = fit ? { vt: d.vt, vtKey: d.vtKey, fit } : null;
+    return fit;
+  }
+  function vertexTransformOf(d, PW, PH) {
     const [vx, vy, vw, vh] = d.viewport;
     if (!(vw > 0 && vh > 0)) return null;
     const x0 = Math.max(0, vx), y0 = Math.max(0, vy), x1 = Math.min(PW, vx + vw), y1 = Math.min(PH, vy + vh);
@@ -427,11 +445,15 @@ fn dec3n(v: u32) -> vec4<f32> {
   let qkDebugOn = false;
   const qkDebug = () => !!(window.s3dNoCull || window.s3dNoStencil || window.s3dFlipCull || window.s3dSolid ||
                            window.s3dNoDepth || window.s3dUnclipped);
+  // (whether a draw has a stream or indices: a captured buffer has an id, and
+  // its bytes - data - may be gone once the GPU has them; a recorded
+  // pipeline's streams, made at prewarm, have only data)
+  const present = b => b.has !== undefined ? b.has : !!b.data;
   function quickKey(d) {
     const st = d.streams, p = d.params, v = qkValues;
     let n = 0;
     v[n++] = d.decl;
-    for (let s = 0; s < 4; s++) v[n++] = st[s].data ? st[s].stride : -1;
+    for (let s = 0; s < 4; s++) v[n++] = present(st[s]) ? st[s].stride : -1;
     v[n++] = d.topology; v[n++] = d.index32; v[n++] = d.indexed ? 1 : 0; v[n++] = d.viewport[4] === d.viewport[5] ? 1 : 0;
     v[n++] = d.noDepth ? 1 : 0; v[n++] = d.alphaSpec; v[n++] = d.targetMask; v[n++] = p[19];
     for (let i = 0; i < 4; i++) v[n++] = d.blends[i];
@@ -449,8 +471,8 @@ fn dec3n(v: u32) -> vec4<f32> {
   }
   function quickKeyString(d) {
     const st = d.streams, p = d.params;
-    return d.vs + d.ps + d.decl + ',' + (st[0].data ? st[0].stride : -1) + ',' + (st[1].data ? st[1].stride : -1) + ',' +
-      (st[2].data ? st[2].stride : -1) + ',' + (st[3].data ? st[3].stride : -1) + ',' + d.topology + ',' + d.index32 +
+    return d.vs + d.ps + d.decl + ',' + (present(st[0]) ? st[0].stride : -1) + ',' + (present(st[1]) ? st[1].stride : -1) + ',' +
+      (present(st[2]) ? st[2].stride : -1) + ',' + (present(st[3]) ? st[3].stride : -1) + ',' + d.topology + ',' + d.index32 +
       ',' + d.indexed + ',' + d.vtKey + ',' + (d.viewport[4] === d.viewport[5]) + ',' + d.noDepth + ',' + d.alphaSpec + ',' + d.targetMask + ',' + (p[19] >>> 0) + ',' + d.blends[0] + ',' + d.blends[1] + ',' + d.blends[2] + ',' +
       d.blends[3] + ',' + d.writeMask + ',' + d.depthEnable + ',' + d.depthFunction + ',' + d.depthWrite + ',' +
       p[0] + ',' + p[1] + ',' + p[2] + ',' + p[3] + ',' + p[4] + ',' + p[5] + ',' + p[11] + ',' + p[12] + ',' + (p[17] & 1) + (window.s3dNoCull ? ',nc' : '') + (window.s3dNoStencil && window.s3dNoStencil.has(d.ps) ? ',ns' : '') + (window.s3dFlipCull && window.s3dFlipCull.has(d.ps) ? ',fc' : '') + (window.s3dSolid && window.s3dSolid.has(d.ps) ? ',so' : '') + (window.s3dNoDepth && window.s3dNoDepth.has(d.ps) ? ',nd' : '') + (window.s3dUnclipped && window.s3dUnclipped.has(d.ps) ? ',uc' : '');
@@ -512,7 +534,7 @@ fn dec3n(v: u32) -> vec4<f32> {
     if (d.prewarm || recordedPipelines.has(fullKey) || recordedPipelines.size >= 6000) return;
     recordedPipelines.set(fullKey, {
       key: fullKey, vs: d.vs, ps: d.ps, psHash: !!d.psHash, decl: d.decl, declElements: decl,
-      streams: d.streams.map(st => ({ data: st.data ? 1 : 0, stride: st.stride })),
+      streams: d.streams.map(st => ({ data: present(st) ? 1 : 0, stride: st.stride })),
       topology: d.topology, index32: d.index32, indexed: d.indexed, viewport: [...d.viewport],
       blends: [...d.blends], params: [...d.params], writeMask: d.writeMask, depthEnable: d.depthEnable,
       depthFunction: d.depthFunction, depthWrite: d.depthWrite, noDepth: d.noDepth, alphaSpec: d.alphaSpec,
@@ -581,7 +603,7 @@ fn dec3n(v: u32) -> vec4<f32> {
       const element = decl.find(e => e.location === input.location);
       const convert = element && kind === 'f' && conversions[element.type];
       if (convert) packed.push([input.location, element.type]);
-      const format = element && d.streams[element.stream] && d.streams[element.stream].data &&
+      const format = element && d.streams[element.stream] && present(d.streams[element.stream]) &&
         (convert ? convert.format : vertexFormat(element.type, kind));
       const stride = element ? d.streams[element.stream]?.stride : 0;
       if (!format || !stride || stride % 4 || element.offset + formatSize[format] > stride) {
@@ -680,15 +702,31 @@ fn dec3n(v: u32) -> vec4<f32> {
   }
 
   // Guest bytes padded to a multiple of 4 (what writeBuffer takes).
+  // (a buffer's bytes copied out of shared memory, which WebGPU won't read,
+  // padded to 4: into one kept scratch buffer - writeBuffer copies them at
+  // once - not a new array each time: thousands of uploads in a busy street
+  // left the page's memory holding the sizes of all of them)
   function padded(heap, at, size) {
-    const out = new Uint8Array((size + 3) & ~3);
+    const n = (size + 3) & ~3, out = keptBytes('upload', n).subarray(0, n);
     out.set(new Uint8Array(heap, at, size));
+    out.fill(0, size, n);
     return out;
   }
   // A converted guest buffer on the GPU, uploaded again when its serial changes.
   // (this frame's own bytes - user-pointer vertices, generated indices - in
   // one buffer, render's arena: buffer.arena its offset there)
   let arenaBuffer = null;
+  // Tells the capture which buffers the GPU has (id and serial; serial 0 when
+  // dropped), so it can let its converted copy go (web_frame_capture.cpp
+  // FreeUploadedBuffers).
+  let bufferAcks = null;
+  function ackBuffer(id, serial) {
+    // (?keepbuffers=1: the capture keeps every converted buffer, as before)
+    if (!Module._rex_web_buffer_acks || /[?&]keepbuffers=1/.test(location.search)) return;
+    if (!bufferAcks || bufferAcks.buffer !== wasmMemory.buffer)
+      bufferAcks = new BigUint64Array(wasmMemory.buffer, Number(Module._rex_web_buffer_acks()), 65536);
+    Atomics.store(bufferAcks, id % 65536, BigInt(id) << 32n | BigInt(serial));
+  }
   function gpuBuffer(heap, buffer, usage) {
     if (!buffer.id && buffer.arena !== undefined && arenaBuffer) return arenaBuffer;
     if (!buffer.id) {
@@ -698,6 +736,13 @@ fn dec3n(v: u32) -> vec4<f32> {
       return b;
     }
     let entry = buffers.get(buffer.id);
+    if ((!entry || entry.serial !== buffer.serial || entry.size < buffer.size) && !buffer.data) {
+      // (the capture let its bytes go as this copy was dropped: the draw is
+      // left out of this frame, the bytes come back with the next)
+      stats.missingBuffers = (stats.missingBuffers || 0) + 1;
+      ackBuffer(buffer.id, 0);
+      return null;
+    }
     if (!entry || entry.serial !== buffer.serial || entry.size < buffer.size) {
       if (entry) entry.buffer.destroy();
       const b = device.createBuffer({ size: Math.max(16, (buffer.size + 3) & ~3),
@@ -706,6 +751,7 @@ fn dec3n(v: u32) -> vec4<f32> {
       entry = { serial: buffer.serial, buffer: b, size: buffer.size };
       buffers.set(buffer.id, entry);
       stats.uploadedBytes += buffer.size;
+      ackBuffer(buffer.id, buffer.serial);
     }
     entry.used = frameSerial;
     return entry.buffer;
@@ -723,8 +769,16 @@ fn dec3n(v: u32) -> vec4<f32> {
     return text;
   }
   function readBuffer(u32, w) {
-    return { data: u32[w] + u32[w + 1] * 4294967296, id: u32[w + 2], serial: u32[w + 3],
+    const data = u32[w] + u32[w + 1] * 4294967296, id = u32[w + 2];
+    return { data, id, has: data !== 0 || id !== 0, serial: u32[w + 3],
              size: u32[w + 4], offset: u32[w + 5], stride: u32[w + 6] };
+  }
+  // (a pooled draw's buffer, filled again: arena cleared, set per frame)
+  function fillBuffer(b, u32, w) {
+    const data = u32[w] + u32[w + 1] * 4294967296, id = u32[w + 2];
+    b.data = data; b.id = id; b.has = data !== 0 || id !== 0; b.serial = u32[w + 3];
+    b.size = u32[w + 4]; b.offset = u32[w + 5]; b.stride = u32[w + 6]; b.arena = 0;
+    return b;
   }
   // (params as floats, read where the capture left them)
   function paramFloat(i) { return heapFloats[this.paramsAt + i]; }
@@ -764,7 +818,55 @@ fn dec3n(v: u32) -> vec4<f32> {
       paramsAt: w + 109,
       paramFloat,
     };
-    d.indexed = d.indices.data !== 0;
+    d.indexed = present(d.indices);
+    return d;
+  }
+  // The frame loop's draws, kept from frame to frame and filled again in
+  // place (readDraw made a dozen objects a draw, thousands of draws a frame:
+  // garbage collections in busy streets). Valid while the frame replays,
+  // like readDraw's; their views are made again only where the record moved.
+  const drawPool = [];
+  function pooledDraw(m, at, i) {
+    let d = drawPool[i];
+    if (!d) {
+      d = drawPool[i] = readDraw(m, at);
+      d.at = at; d.words = heapWords;
+      for (const st of d.streams) st.arena = 0;
+      d.indices.arena = 0;
+      return d;
+    }
+    if (!heapWords || heapWords.buffer !== m.buffer) {
+      heapWords = new Uint32Array(m.buffer);
+      heapFloats = new Float32Array(m.buffer);
+    }
+    const u32 = heapWords, w = at / 4;
+    if (d.at !== at || d.words !== u32) {
+      d.viewport = heapFloats.subarray(w + 27, w + 33);
+      d.textures = u32.subarray(w + 35, w + 61);
+      d.samplerWords = u32.subarray(w + 134, w + 160);
+      d.params = u32.subarray(w + 109, w + 129);
+      d.paramsAt = w + 109;
+      d.at = at; d.words = u32;
+    }
+    d.vs = hexOf(u32[w], u32[w + 1]);
+    d.ps = hexOf(u32[w + 2], u32[w + 3]);
+    d.psHash = (u32[w + 2] | u32[w + 3]) !== 0;
+    d.constants = u32[w + 4] + u32[w + 5] * 4294967296;
+    d.psConstants = u32[w + 130] + u32[w + 131] * 4294967296;
+    d.sharedConstants = u32[w + 132] + u32[w + 133] * 4294967296;
+    fillBuffer(d.indices, u32, w + 6);
+    d.index32 = u32[w + 14]; d.topology = u32[w + 15];
+    d.count = u32[w + 16]; d.first = u32[w + 17]; d.baseVertex = u32[w + 18] | 0;
+    d.decl = u32[w + 19]; d.stage = u32[w + 20]; d.blend = u32[w + 21];
+    d.writeMask = u32[w + 22]; d.depthEnable = u32[w + 23];
+    d.depthFunction = u32[w + 24]; d.depthWrite = u32[w + 25];
+    d.targetWidth = u32[w + 33]; d.targetHeight = u32[w + 34];
+    for (let k = 0; k < 4; k++) fillBuffer(d.streams[k], u32, w + 62 + k * 8);
+    d.kind = u32[w + 94];
+    for (let k = 0; k < 4; k++) { d.colors[k] = u32[w + 95 + k]; d.blends[k] = u32[w + 105 + k]; }
+    d.depth = u32[w + 99];
+    for (let k = 0; k < 5; k++) d.sizes[k] = u32[w + 100 + k];
+    d.indexed = present(d.indices);
     return d;
   }
   const declCache = new Map();
@@ -838,6 +940,33 @@ fn dec3n(v: u32) -> vec4<f32> {
   }
   const cachedGroups = new Map();
   let frameConstantGroups = new Map();
+  // The constants and the frame's own vertex and index bytes: one GPU buffer
+  // each, kept from frame to frame (the queue writes a frame's bytes after
+  // the last frame's draws have read theirs) and replaced only when a frame
+  // needs more; their bytes built in arrays kept the same way. A new buffer
+  // and array of each a frame was a few MB of churn in the GPU process and
+  // the garbage collector, and bind groups that couldn't be kept.
+  const kept = { constants: null, constantsSize: 0, own: null, ownSize: 0, constantBytes: null, ownBytes: null };
+  function keptBuffer(name, size, usage) {
+    if (!kept[name] || kept[name + 'Size'] < size) {
+      if (kept[name]) stats.retired.push(kept[name]);
+      const grown = Math.max(1 << 20, 2 ** Math.ceil(Math.log2(size)));
+      kept[name] = device.createBuffer({ size: grown, usage: usage | GPUBufferUsage.COPY_DST });
+      kept[name + 'Size'] = grown;
+      if (name === 'constants') frameConstantGroups = new Map();  // (their bind groups name the old one)
+    }
+    return kept[name];
+  }
+  function keptBytes(name, size) {
+    if (!kept[name] || kept[name].byteLength < size) kept[name] = new Uint8Array(Math.max(1 << 20, 2 ** Math.ceil(Math.log2(size))));
+    return kept[name];
+  }
+  const viewScratch = [];  // (a draw's texture views, while its bind group is looked up)
+  // The last texture and sampler groups made or found, by the words they came
+  // from; the textures' only while groupEpoch stays (a frame, up to a resolve:
+  // a resolve or a packed alias can give the same word another view).
+  const lastGroups = [null, { layout: null, epoch: -1, bg: null, words: [] }, { layout: null, bg: null, words: [] }];
+  let groupEpoch = 0;
 
   // A stand-in for textures this renderer doesn't have (transparent black, so
   // blended effects sampling one add nothing).
@@ -1081,53 +1210,37 @@ fn dec3n(v: u32) -> vec4<f32> {
       // other list - index.html, WebFrame::reading)
       if (this.onHeaderRead) this.onHeaderRead();
       textureViewFn = textureView;
-      frameConstantGroups = new Map();  // (this frame's constants buffer)
+      groupEpoch++;  // (a new frame: its texture table's views)
       Object.assign(stats, { events: eventCount, drawn: 0, skippedShader: 0, skippedPipeline: 0, pending: 0, passes: 0,
         resolves: 0, clears: 0, uploadedBytes: 0, transient: [], retired: [] });
       if (!eventCount) return;
       const events = [];
       for (let i = 0; i < eventCount; i++) {
-        const e = readDraw(m, eventTable + i * DRAW_SIZE);
+        const e = window.s3dNoPool ? readDraw(m, eventTable + i * DRAW_SIZE) : pooledDraw(m, eventTable + i * DRAW_SIZE, i);
         if (e.kind !== 0 || window.scene3dFilter(e, i)) events.push(e);
       }
       const profRead = performance.now();
-      // Constants for every draw in one buffer, 256-byte aligned.
-      // Each distinct block (vertex, pixel, shared constants) once: draws
-      // sharing a block's bytes point at the same one (web_frame_capture.h).
+      // The frame's draw bytes - its constant blocks, and its own vertices and
+      // indices (user-pointer vertices, generated indices) - are one block
+      // (web_frame_capture.h WebFrame::draw_bytes): copied out whole (WebGPU
+      // won't take shared memory) into one buffer, each draw's blocks and own
+      // buffers at their offsets in it. (Bindings name 4 KiB, which may run on
+      // over the next blocks - they are read-only - and into the padding.)
       const drawEvents = events.filter(e => e.kind === 0);
-      // (each block only as much as the shaders that read it need,
-      // constantNeed: bindings still name 4 KiB, which may run on over the
-      // next blocks - they are read-only - and past the end into padding)
-      const blockNeeds = new Map();
-      const need = (pointer, size) => blockNeeds.set(pointer, Math.max(blockNeeds.get(pointer) || 0, size));
+      const bytesBase = Number(m.getBigUint64(frame + 88, true)), bytesSize = m.getUint32(frame + 96, true);
+      const constantSize = bytesSize;
+      const constantBytes = keptBytes('constantBytes', constantSize + 4096);
+      if (bytesSize && bytesBase > 0 && bytesBase + bytesSize <= heap.byteLength) {
+        constantBytes.set(new Uint8Array(heap, bytesBase, bytesSize));
+      } else if (bytesSize) {
+        stats.badConstants = (stats.badConstants || 0) + 1;
+      }
+      // (a pointer outside the block - one the capture didn't resolve - reads the padding's zeros)
+      const offsetOf = pointer => pointer >= bytesBase && pointer < bytesBase + bytesSize ? pointer - bytesBase : constantSize;
       for (const d of drawEvents) {
-        const v = shaders.get(d.vs), f = d.psHash ? shaders.get(d.ps) : null;
-        const vn = v && v.constantNeed, fn = d.psHash ? f && f.constantNeed : [0, 0];
-        need(d.constants, vn && fn ? Math.max(vn[0], fn[0]) : 4096);
-        need(d.psConstants, vn && fn ? Math.max(vn[1], fn[1]) : 4096);
-        need(d.sharedConstants, 1280);
+        d.cOff = [offsetOf(d.constants), offsetOf(d.psConstants), offsetOf(d.sharedConstants)];
       }
-      const blockOffsets = new Map();
-      let constantSize = 0;
-      const place = pointer => {
-        let block = blockOffsets.get(pointer);
-        if (!block) {
-          const size = blockNeeds.get(pointer);
-          blockOffsets.set(pointer, block = { offset: constantSize, size });
-          constantSize += Math.ceil(size / 256) * 256;
-        }
-        return block.offset;
-      };
-      for (const d of drawEvents) {
-        d.cOff = [place(d.constants), place(d.psConstants), place(d.sharedConstants)];
-      }
-      const constantBytes = new Uint8Array(constantSize + 4096);
-      for (const [pointer, block] of blockOffsets) {
-        // (a block pointer outside memory - one the capture didn't resolve -
-        // stays zeros rather than ending the frame's replay)
-        if (!(pointer > 0 && pointer + block.size <= heap.byteLength)) { stats.badConstants = (stats.badConstants || 0) + 1; continue; }
-        constantBytes.set(new Uint8Array(heap, pointer, block.size), block.offset);
-      }
+      constantBytes.fill(0, constantSize, constantSize + 4096);
       // (window.s3dNoClip, debugging: no draw's user clip plane enabled, the
       // shared constants' byte at 0x240)
       if (window.s3dNoClip) for (const d of drawEvents) constantBytes[d.cOff[2] + 0x240] = 0;
@@ -1140,36 +1253,16 @@ fn dec3n(v: u32) -> vec4<f32> {
         if (d.ps !== ov.ps) continue;
         new Float32Array(constantBytes.buffer, d.cOff[1] + ov.reg * 16, 4).set(ov.value);
       }
-      stats.constantBlocks = blockOffsets.size;
-      // This frame's own vertex and index bytes, one buffer and one upload (a
-      // buffer each cost a createBuffer and a writeBuffer per draw).
-      {
-        const parts = [];
-        let arenaSize = 0;
-        const placeOwn = b => {
-          if (!b || !b.data || b.id) return;
-          b.arena = arenaSize;
-          arenaSize += (b.size + 15) & ~15;
-          parts.push(b);
-        };
-        for (const d of drawEvents) { if (d.indexed) placeOwn(d.indices); for (const st of d.streams) placeOwn(st); }
-        arenaBuffer = null;
-        if (arenaSize) {
-          arenaBuffer = device.createBuffer({ size: arenaSize, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
-          const own = new Uint8Array(arenaSize);
-          for (const b of parts) {
-            if (b.data > 0 && b.data + b.size <= heap.byteLength) own.set(new Uint8Array(heap, b.data, b.size), b.arena);
-          }
-          device.queue.writeBuffer(arenaBuffer, 0, own);
-          stats.transient.push(arenaBuffer);
-          stats.ownBytes = arenaSize;
-          stats.ownBuffers = parts.length;
-        }
+      // The frame's own vertex and index bytes: in the same buffer.
+      for (const d of drawEvents) {
+        if (d.indexed && d.indices.data && !d.indices.id) d.indices.arena = offsetOf(d.indices.data);
+        for (const st of d.streams) if (st.data && !st.id) st.arena = offsetOf(st.data);
       }
-      const constants = device.createBuffer({ size: constantBytes.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const constants = keptBuffer('constants', constantSize + 4096,
+                                   GPUBufferUsage.UNIFORM | GPUBufferUsage.VERTEX | GPUBufferUsage.INDEX);
+      arenaBuffer = constants;
       const profCopy = performance.now();
-      device.queue.writeBuffer(constants, 0, constantBytes);
-      stats.transient.push(constants);
+      device.queue.writeBuffer(constants, 0, constantBytes, 0, constantSize + 4096);
       const profUpload = performance.now();
 
       let pass = null, passKey = '';
@@ -1224,8 +1317,10 @@ fn dec3n(v: u32) -> vec4<f32> {
         // (the state set in this pass, so a draw sets only what changed: each
         // call into WebGPU costs about a microsecond on a slow CPU, and most
         // draws repeat most of the last one's state)
-        pass.s = { pipeline: null, bg: [null, null, null], off0: '', vb: [], vbOff: [], ib: null, ibOff: -1, ibFormat: '',
-                   viewport: '', scissor: '', stencil: -1, blend: '' };
+        // (the viewport, scissor and blend as numbers, compared one by one:
+        // building a string to compare for each draw cost more than the rest)
+        pass.s = { pipeline: null, bg: [null, null, null], off0: new Uint32Array(8), off0n: -1, vb: [], vbOff: [], ib: null, ibOff: -1, ibFormat: '',
+                   viewport: [NaN, 0, 0, 0, 0, 0], scissor: [-1, 0, 0, 0], stencil: -1, blend: [NaN, 0, 0, 0, 0] };
         passKey = key;
         stats.passes++;
         return mask;
@@ -1260,11 +1355,13 @@ fn dec3n(v: u32) -> vec4<f32> {
           endPass();
           stats.resolves++;
           this.resolve(e, encoder, flushClear, floats);
+          groupEpoch++;
           continue;
         }
         if (e.kind === 3) {
           endPass();
           this.depthHandoff(e, encoder, flushClear);
+          groupEpoch++;
           continue;
         }
         const d = e;
@@ -1296,9 +1393,10 @@ fn dec3n(v: u32) -> vec4<f32> {
           continue;
         }
         // (packed-depth aliases it samples, made before its pass opens)
-        if (d.textures.some(t => (t >>> 30) === 3)) {
-          for (const t of d.textures) if ((t >>> 30) === 3) this.packedAlias(t, encoder, endPass);
-        }
+        const tw = d.textures;
+        let aliased = false;
+        for (let i = 0; i < tw.length; i++) if ((tw[i] >>> 30) === 3) { aliased = true; this.packedAlias(tw[i], encoder, endPass); }
+        if (aliased) groupEpoch++;
         const mask = beginPass(d);
         if (mask === null) continue;
         d.targetMask = mask;
@@ -1323,7 +1421,8 @@ fn dec3n(v: u32) -> vec4<f32> {
         if (explicit) {
           // Explicit layouts: the constants by dynamic offset (one bind group
           // per layout per frame), textures and samplers cached by contents.
-          explicit.groups.forEach((g, gi) => {
+          for (let gi = 0; gi < explicit.groups.length; gi++) {
+            const g = explicit.groups[gi];
             if (gi === 0) {
               let bg = frameConstantGroups.get(g.id);
               if (!bg) {
@@ -1331,36 +1430,65 @@ fn dec3n(v: u32) -> vec4<f32> {
                   resource: { buffer: constants, offset: 0, size: b.binding === 2 ? 1280 : 4096 } })) });
                 frameConstantGroups.set(g.id, bg);
               }
-              const offsets = g.bindings.map(b => d.cOff[b.binding] || 0);
-              const off = offsets.join();
-              if (ps0.bg[0] !== bg || ps0.off0 !== off) { pass.setBindGroup(0, bg, offsets); ps0.bg[0] = bg; ps0.off0 = off; }
+              let same = ps0.bg[0] === bg && ps0.off0n === g.bindings.length;
+              for (let i = 0; same && i < g.bindings.length; i++) same = ps0.off0[i] === (d.cOff[g.bindings[i].binding] || 0);
+              if (!same) {
+                // (the offsets from a kept Uint32Array: a new JS array each
+                // draw cost its conversion in every call)
+                const offsets = ps0.off0, n = g.bindings.length;
+                for (let i = 0; i < n; i++) offsets[i] = d.cOff[g.bindings[i].binding] || 0;
+                pass.setBindGroup(0, bg, offsets, 0, n);
+                ps0.bg[0] = bg; ps0.off0n = n;
+              }
             } else if (gi === 1) {
-              const views = g.bindings.map(b => bindingView(b, d));
-              let key = g.id + ':';
-              for (const v of views) key += viewId(v) + ',';
-              let bg = cachedGroups.get(key);
+              // (the last draw's group again when this layout's textures are
+              // the same words: no resolve since, so the same views)
+              const last = lastGroups[1];
+              let bg = null;
+              if (last.layout === g && last.epoch === groupEpoch) {
+                bg = last.bg;
+                for (let i = 0; i < g.bindings.length && bg; i++) if (last.words[i] !== d.textures[g.bindings[i].binding & 31]) bg = null;
+              }
               if (!bg) {
-                bg = device.createBindGroup({ layout: g.layout, entries: g.bindings.map((b, i) => ({ binding: b.binding, resource: views[i] })) });
-                if (cachedGroups.size > 8000) cachedGroups.clear();
-                cachedGroups.set(key, bg);
+                const views = viewScratch;
+                let key = g.id + ':';
+                for (let i = 0; i < g.bindings.length; i++) key += viewId(views[i] = bindingView(g.bindings[i], d)) + ',';
+                bg = cachedGroups.get(key);
+                if (!bg) {
+                  bg = device.createBindGroup({ layout: g.layout, entries: g.bindings.map((b, i) => ({ binding: b.binding, resource: views[i] })) });
+                  if (cachedGroups.size > 8000) cachedGroups.clear();
+                  cachedGroups.set(key, bg);
+                }
+                last.layout = g; last.epoch = groupEpoch; last.bg = bg;
+                for (let i = 0; i < g.bindings.length; i++) last.words[i] = d.textures[g.bindings[i].binding & 31];
               }
               if (ps0.bg[1] !== bg) { pass.setBindGroup(1, bg); ps0.bg[1] = bg; }
             } else {
-              let key = 's' + g.id + ':';
-              for (const b of g.bindings) key += d.samplerWords[b.binding & 31] + ',';
-              let bg = cachedGroups.get(key);
+              const last = lastGroups[2];
+              let bg = null;
+              if (last.layout === g) {
+                bg = last.bg;
+                for (let i = 0; i < g.bindings.length && bg; i++) if (last.words[i] !== d.samplerWords[g.bindings[i].binding & 31]) bg = null;
+              }
               if (!bg) {
-                bg = device.createBindGroup({ layout: g.layout, entries: g.bindings.map(b => ({ binding: b.binding,
-                  resource: samplerFor(d.samplerWords[b.binding & 31], b.type === 'sampler_comparison') })) });
-                cachedGroups.set(key, bg);
+                let key = 's' + g.id + ':';
+                for (const b of g.bindings) key += d.samplerWords[b.binding & 31] + ',';
+                bg = cachedGroups.get(key);
+                if (!bg) {
+                  bg = device.createBindGroup({ layout: g.layout, entries: g.bindings.map(b => ({ binding: b.binding,
+                    resource: samplerFor(d.samplerWords[b.binding & 31], b.type === 'sampler_comparison') })) });
+                  cachedGroups.set(key, bg);
+                }
+                last.layout = g; last.bg = bg;
+                for (let i = 0; i < g.bindings.length; i++) last.words[i] = d.samplerWords[g.bindings[i].binding & 31];
               }
               if (ps0.bg[2] !== bg) { pass.setBindGroup(2, bg); ps0.bg[2] = bg; }
             }
-          });
+          }
         }
         // Bind groups 0-2 as the shaders declare them (auto layouts).
-        const groups = [[], [], []];
         if (!explicit) {
+        const groups = [[], [], []];
         for (const info of [vs.info, ps && ps.info]) {
           if (!info) continue;
           for (const b of info.bindings) {
@@ -1381,9 +1509,10 @@ fn dec3n(v: u32) -> vec4<f32> {
           pass.setBindGroup(g, device.createBindGroup({ layout: pipeline.getBindGroupLayout(g), entries: groups[g] }));
         }
         ps0.bg = [null, null, null];
-        ps0.off0 = '';
+        ps0.off0n = -1;
         }
         const profC = window.s3dProf ? performance.now() : 0;
+        let missing = false;
         for (let slot = 0; slot < layouts.length; slot++) {
           const l = layouts[slot];
           let buffer, offset = 0;
@@ -1392,6 +1521,7 @@ fn dec3n(v: u32) -> vec4<f32> {
           } else {
             const st = d.streams[l.stream];
             buffer = gpuBuffer(heap, st, GPUBufferUsage.VERTEX);
+            if (!buffer) { missing = true; break; }
             offset = (st.offset & ~3) + (st.arena || 0);
           }
           if (ps0.vb[slot] !== buffer || ps0.vbOff[slot] !== offset) {
@@ -1406,10 +1536,10 @@ fn dec3n(v: u32) -> vec4<f32> {
         const PW = pass.width, PH = pass.height;
         const [x, y, w, h] = fit.rect;
         const z0 = Math.min(1, Math.max(0, d.viewport[4] || 0)), z1 = Math.min(1, Math.max(0, d.viewport[5] || 0));
-        const viewportKey = x + ',' + y + ',' + w + ',' + h + ',' + z0 + ',' + z1;
-        if (ps0.viewport !== viewportKey) {
+        const vp = ps0.viewport;
+        if (vp[0] !== x || vp[1] !== y || vp[2] !== w || vp[3] !== h || vp[4] !== z0 || vp[5] !== z1) {
           pass.setViewport(x, y, w, h, Math.min(z0, z1), Math.max(z0, z1));
-          ps0.viewport = viewportKey;
+          vp[0] = x; vp[1] = y; vp[2] = w; vp[3] = h; vp[4] = z0; vp[5] = z1;
         }
         // Dynamic state: scissor, stencil reference, blend constant.
         // (the scissor always: the hardware's window scissor, which the XDK
@@ -1417,8 +1547,11 @@ fn dec3n(v: u32) -> vec4<f32> {
         const sl = Math.max(0, Math.min(PW, p[7] | 0)), st = Math.max(0, Math.min(PH, p[8] | 0));
         const sr = Math.max(sl, Math.min(PW, p[9] | 0)), sb = Math.max(st, Math.min(PH, p[10] | 0));
         if (sr <= sl || sb <= st) continue;  // nothing would be drawn
-        const scissorKey = sl + ',' + st + ',' + sr + ',' + sb;
-        if (ps0.scissor !== scissorKey) { pass.setScissorRect(sl, st, sr - sl, sb - st); ps0.scissor = scissorKey; }
+        const sc = ps0.scissor;
+        if (sc[0] !== sl || sc[1] !== st || sc[2] !== sr || sc[3] !== sb) {
+          pass.setScissorRect(sl, st, sr - sl, sb - st);
+          sc[0] = sl; sc[1] = st; sc[2] = sr; sc[3] = sb;
+        }
         const stencil = stencilWord(d) & 255;
         if (ps0.stencil !== stencil) { pass.setStencilReference(stencil); ps0.stencil = stencil; }
         // (blend factors 14 and 15, constant alpha, read the constant's alpha
@@ -1435,15 +1568,17 @@ fn dec3n(v: u32) -> vec4<f32> {
           }
         }
         const constantAlpha = alphaFactor && !colorFactor;
-        const blendKey = (constantAlpha ? 'a' : 'c') + p[13] + ',' + p[14] + ',' + p[15] + ',' + p[16];
-        if (ps0.blend !== blendKey) {
+        const bl = ps0.blend, ca = constantAlpha ? 1 : 0;
+        if (bl[0] !== ca || bl[1] !== p[13] || bl[2] !== p[14] || bl[3] !== p[15] || bl[4] !== p[16]) {
           blendWords[0] = p[13]; blendWords[1] = p[14]; blendWords[2] = p[15]; blendWords[3] = p[16];
           const bc = blendFloats;
           pass.setBlendConstant(constantAlpha ? { r: bc[3], g: bc[3], b: bc[3], a: bc[3] } : { r: bc[0], g: bc[1], b: bc[2], a: bc[3] });
-          ps0.blend = blendKey;
+          bl[0] = ca; bl[1] = p[13]; bl[2] = p[14]; bl[3] = p[15]; bl[4] = p[16];
         }
+        if (missing) continue;
         if (d.indexed) {
           const ib = gpuBuffer(heap, d.indices, GPUBufferUsage.INDEX), ibFormat = d.index32 ? 'uint32' : 'uint16';
+          if (!ib) continue;
           const ibOff = d.indices.arena || 0;
           if (ps0.ib !== ib || ps0.ibOff !== ibOff || ps0.ibFormat !== ibFormat) {
             pass.setIndexBuffer(ib, ibFormat, ibOff);
@@ -1547,7 +1682,7 @@ fn dec3n(v: u32) -> vec4<f32> {
       frameSerial++;
       if (frameSerial % 60) return;
       const old = frameSerial - 300;
-      for (const [id, b] of buffers) if (!(b.used > old)) { stats.retired.push(b.buffer); buffers.delete(id); }
+      for (const [id, b] of buffers) if (!(b.used > old)) { stats.retired.push(b.buffer); buffers.delete(id); ackBuffer(id, 0); }
       for (const [h, t] of surfaces) if (!(t.used > old)) { t.texture.label += ' evicted@' + frameSerial; stats.retired.push(t.texture); surfaces.delete(h); }
       for (const [id, t] of resolved) {
         if (t === this.lastFront || this.frontIds.has(id) || t.used > old) continue;

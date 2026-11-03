@@ -24,23 +24,41 @@
          font: 600 12px/1.3 ui-monospace, Menlo, monospace; color: #9f9; background: rgba(0, 0, 0, 0.6); }
   #fps[hidden] { display: none; }
 
-  /* Loading: what's happening, how far along, and a note when it goes quiet. */
-  #loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-             background: radial-gradient(ellipse at center, #1c1c1c 0%, #000 75%); pointer-events: none; }
+  /* Loading, as the game's own loading screens: its artwork over the whole
+     picture, drifting slowly, the logo, and at the bottom what's happening,
+     how far along, and a note when it goes quiet - in the hub's condensed
+     type (the PS5 hub's fonts and art, /app0), white on the art. */
+  @font-face { font-family: 'Heros Condensed'; font-weight: 700;
+               src: url('/app0/fonts/texgyreheroscn-bold.otf') format('opentype'); }
+  @font-face { font-family: 'Heros Condensed'; font-weight: 400;
+               src: url('/app0/fonts/texgyreheroscn-regular.otf') format('opentype'); }
+  #loading { position: absolute; inset: 0; overflow: hidden; background: #000; pointer-events: none;
+             font-family: 'Heros Condensed', 'Arial Narrow', sans-serif; container-type: size; }
   #loading[hidden] { display: none; }
-  #loading .box { width: min(440px, 80%); text-align: left; }
-  #loading .title { font: 800 clamp(28px, 5vw, 46px)/1 -apple-system, system-ui, sans-serif; letter-spacing: 0.02em; color: #fff; }
-  #phase { margin-top: 18px; font-weight: 600; color: var(--fg); }
-  .track { position: relative; height: 6px; margin-top: 10px; border-radius: 3px; background: #2a2a2a; overflow: hidden; }
-  #fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; border-radius: 3px; background: var(--accent);
-          transition: width 0.4s ease; }
-  .track.busy #fill { width: 30% !important; animation: busy 1.3s ease-in-out infinite; }
-  @keyframes busy { from { left: -30%; } to { left: 100%; } }
-  #detail { margin-top: 8px; min-height: 1.4em; font-size: 13px; color: var(--dim); font-variant-numeric: tabular-nums; }
-  #stall { margin-top: 10px; font-size: 13px; color: var(--accent); }
+  #loading .art { position: absolute; inset: 0; background: center / cover no-repeat;
+                  animation: drift 24s ease-in-out infinite alternate; }
+  @keyframes drift { from { transform: scale(1.04) translateX(-1%); } to { transform: scale(1.12) translateX(1.5%); } }
+  /* (dark at the bottom, where the text is, and a little all round) */
+  #loading .shade { position: absolute; inset: 0;
+                    background: linear-gradient(to top, rgba(0,0,0,.88) 0%, rgba(0,0,0,.35) 30%, rgba(0,0,0,0) 55%),
+                                radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,.55) 100%); }
+  #loading .logo { position: absolute; left: 5%; top: 7%; width: 22%; aspect-ratio: 1400 / 1077;
+                   background: url('/app0/hub/logo.png') center / contain no-repeat;
+                   filter: drop-shadow(0 0.4cqh 1.2cqh rgba(0,0,0,.6)); }
+  #loading .box { position: absolute; left: 5%; right: 5%; bottom: 7%; text-align: left; }
+  #loading .title { display: none; }
+  #phase { font-weight: 700; font-size: max(14px, 3.4cqh); line-height: 1.1; letter-spacing: .06em;
+           text-transform: uppercase; color: #fff; text-shadow: 0 1px 4px rgba(0,0,0,.8); }
+  .track { position: relative; height: max(3px, 0.55cqh); margin-top: 1.4cqh; background: rgba(255,255,255,.18); overflow: hidden; }
+  #fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: #fff; transition: width 0.4s ease; }
+  .track.busy #fill { width: 22% !important; animation: busy 1.6s ease-in-out infinite; }
+  @keyframes busy { from { left: -22%; } to { left: 100%; } }
+  #detail { margin-top: 1.1cqh; min-height: 1.3em; font-size: max(12px, 2.2cqh); letter-spacing: .03em; color: rgba(255,255,255,.78);
+            font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px rgba(0,0,0,.8); }
+  #stall { margin-top: 1cqh; font-size: max(12px, 2.1cqh); color: var(--accent); text-shadow: 0 1px 3px rgba(0,0,0,.8); }
   #loading.failed #phase { color: var(--err); }
   #loading.failed .track { display: none; }
-  #loading button { pointer-events: auto; }
+  #loading button { pointer-events: auto; font-family: inherit; }
 
   /* The buttons: top right, shown while the mouse moves (and always while loading). */
   #bar { position: fixed; top: 10px; right: 10px; display: flex; gap: 6px; z-index: 3; transition: opacity 0.3s; }
@@ -70,6 +88,9 @@
 <canvas id="canvas" tabindex="-1"></canvas>
 <div id="fps" hidden></div>
 <div id="loading">
+  <div class="art" style="background-image: url('/app0/hub/hero.jpg')"></div>
+  <div class="shade"></div>
+  <div class="logo"></div>
   <div class="box">
     <div class="title">GTA IV</div>
     <div id="phase">Starting…</div>
@@ -414,6 +435,7 @@
       line('web screen: compressed (BC) textures on');
     }
     let retiredTextures = [];
+    let uploadScratch = null;  // (texture pixels on their way to writeTexture)
     let sequence = -1, frames = 0, thumbs = 0;
     const targetTextures = {};  // base address -> { serial, texture, width, height, bind }
     line('web screen: WebGPU ready (' + format + ')');
@@ -429,6 +451,15 @@
         else out[i] = sign | (e << 10) | ((m + 0x1000) >> 13);
       }
       return new Uint8Array(out.buffer);
+    }
+
+    // Tells the capture a slot's pixels are on the GPU, so it can let them go
+    // (web_frame_capture.cpp FreeUploadedPixels).
+    let acks = null;
+    function uploaded(index, serial) {
+      if (!Module._rex_web_texture_acks) return;
+      if (!acks || acks.buffer !== wasmMemory.buffer) acks = new Uint32Array(wasmMemory.buffer, Number(Module._rex_web_texture_acks()), 4096);
+      Atomics.store(acks, index, serial);
     }
 
     function syncTexture(memory, table, index) {
@@ -469,9 +500,17 @@
             { offset: mip.offset, bytesPerRow: mip.bytesPerRow }, mip.size);
         }
       };
-      // WebGPU will not read from shared memory: copy the pixels out first.
-      const copy = halve ? toHalf(new Float32Array(wasmMemory.buffer.slice(pixels, pixels + byteCount * 2)))
-                         : new Uint8Array(wasmMemory.buffer, pixels, byteCount).slice();
+      // WebGPU will not read from shared memory: copy the pixels out first
+      // (into one kept buffer - writeTexture copies them at once - rather
+      // than a new array for each texture, whose memory the page then kept).
+      let copy;
+      if (halve) {
+        copy = toHalf(new Float32Array(wasmMemory.buffer.slice(pixels, pixels + byteCount * 2)));
+      } else {
+        if (!uploadScratch || uploadScratch.byteLength < byteCount) uploadScratch = new Uint8Array(Math.max(1 << 20, 2 ** Math.ceil(Math.log2(byteCount))));
+        copy = uploadScratch.subarray(0, byteCount);
+        copy.set(new Uint8Array(wasmMemory.buffer, pixels, byteCount));
+      }
       const old = slots[index];
       if (old && old.width === width && old.height === height && old.format === texFormat && old.levels === levels &&
           old.faces === faces) {
@@ -479,6 +518,7 @@
         // recorded this frame see the new pixels, as on the console.
         upload(old.texture, copy);
         old.serial = serial;
+        uploaded(index, serial);
         return old.bind;
       }
       // Commands recorded this frame may still use the old one.
@@ -490,6 +530,7 @@
       const view = faces === 6 ? Object.assign(texture.createView({ dimension: 'cube' }), { rexCube: true }) : texture.createView();
       slots[index] = { serial, texture, width, height, format: texFormat, levels, faces,
                        bind: faces === 6 ? whiteBind : bindFor(texture), view };
+      uploaded(index, serial);
       if (!bc && texelBytes === 4 && faces === 1 && location.search.includes('show2d') && thumbs++ < 48 && width >= 64) {
         const thumb = document.createElement('canvas');
         thumb.width = width; thumb.height = height;

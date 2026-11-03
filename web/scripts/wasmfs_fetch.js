@@ -13,7 +13,7 @@
  * - reads ahead while a file is read in order (the installer copies files
  *   front to back), up to READ_AHEAD bytes, in requests of up to RUN blocks,
  *   several at once (LANES): the speed of one stream stops mattering;
- * - keeps at most CACHE bytes, least recently used first out;
+ * - keeps at most CACHE bytes (less on a small device), least recently used first out;
  * - retries a failed or cut request (TRIES times, waiting longer each time);
  * - posts the bytes it fetched on the 'gta4-net' BroadcastChannel twice a
  *   second, for the loading screen's speed.
@@ -27,7 +27,12 @@ addToLibrary({
     '_wasmfs_fetch_get_file_url',
   ],
   _wasmfs_create_fetch_backend_js: async function(backend) {
-    const BLOCK = 1 << 20, RUN = 4, READ_AHEAD = 32 << 20, LANES = 8, CACHE = 320 << 20, TRIES = 8;
+    // (the cache in JavaScript memory: 320 MB, or 96 MB on a device with 4 GB
+    // or less - a Chromebook, a phone - where the page's memory is what runs
+    // out; the browser's own cache still has the bytes)
+    const deviceMemory = (typeof navigator !== 'undefined' && navigator.deviceMemory) || 8;
+    const BLOCK = 1 << 20, RUN = 4, READ_AHEAD = 32 << 20, LANES = 8, TRIES = 8;
+    const CACHE = (deviceMemory <= 4 ? 96 : 320) << 20;
     const files = new Map();      // file pointer -> {url, size, blocks: Map(index -> Uint8Array), pending: Map(index -> Promise), cursors}
     const lru = new Map();        // `${file}:${index}` -> [state, index], oldest first
     let cached = 0, active = 0, fetched = 0;

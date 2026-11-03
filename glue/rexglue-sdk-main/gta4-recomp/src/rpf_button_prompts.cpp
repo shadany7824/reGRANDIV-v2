@@ -879,11 +879,35 @@ void PatchLoadedGuideLabel(uint8_t* base) {
   const std::string_view needle(kNeedle, sizeof(kNeedle) - 1);
   const std::boyer_moore_horspool_searcher searcher(needle.begin(), needle.end());
   g_guide_strings.clear();
-  // (the game's heaps: the physical window and the virtual heap)
-  const std::pair<uint32_t, uint32_t> regions[] = {{0xA0000000u, 0x20000000u}, {0x40000000u, 0x40000000u}};
+  // (the game's heaps: the physical memory, through each of its windows, and
+  // the virtual heap - only what is committed in them: reading all of their
+  // 1.5 GB touched every page of it, and a page read is a page the browser
+  // commits on macOS and Windows, a gigabyte the first time the game paused)
+  auto* memory = rex::Runtime::instance() ? rex::Runtime::instance()->memory() : nullptr;
+  if (!memory) return;
+  std::vector<std::pair<const char*, const char*>> ranges;
+  const std::pair<uint32_t, uint32_t> regions[] = {
+      {0xA0000000u, 0x20000000u}, {0xC0000000u, 0x20000000u}, {0xE0000000u, 0x1FFFF000u}, {0x40000000u, 0x3F000000u}};
   for (const auto& [start, size] : regions) {
-    const char* first = reinterpret_cast<const char*>(REX_RAW_ADDR(start));
-    const char* last = first + size;
+    auto* heap = memory->LookupHeap(start);
+    for (uint64_t at = start; heap && at < uint64_t(start) + size;) {
+      rex::memory::HeapAllocationInfo info{};
+      if (!heap->QueryRegionInfo(uint32_t(at), &info) || !info.region_size) break;
+      const uint64_t end = std::min<uint64_t>(at + info.region_size, uint64_t(start) + size);
+      if (info.state & rex::memory::kMemoryAllocationCommit) {
+        const char* first = reinterpret_cast<const char*>(memory->TranslateVirtual(uint32_t(at)));
+        ranges.push_back({first, first + (end - at)});
+      }
+      at = end;
+    }
+  }
+  // (the windows alias the same memory: each host range searched once)
+  std::sort(ranges.begin(), ranges.end());
+  const char* searched_to = nullptr;
+  for (auto [first, last] : ranges) {
+    if (searched_to && first < searched_to) first = std::min(last, searched_to);
+    if (first >= last) continue;
+    searched_to = last;
     for (const char* it = std::search(first, last, searcher); it != last && g_guide_strings.size() < 8;
          it = std::search(it + 1, last, searcher)) {
       uint8_t* text = reinterpret_cast<uint8_t*>(const_cast<char*>(it + 1));
