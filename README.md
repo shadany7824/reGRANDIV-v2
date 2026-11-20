@@ -8,7 +8,7 @@ Forked from here. Go support him. https://github.com/itzzace/gta4-web
 
 # Link
 
-Discord: https://discord.gg/hrbcPjjZfj
+Discord: https://discord.gg/MzFABxxSq7
 
 Telegram: https://t.me/reGRANDTA/
 
